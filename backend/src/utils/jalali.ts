@@ -82,6 +82,54 @@ export function jalaliToGregorian(jy: number, jm: number, jd: number): Date {
   return new Date(Date.UTC(gY, gM! - 1, gd!));
 }
 
+/** Julian day number for a Jalali (jy, jm, jd). */
+function j2d(jy: number, jm: number, jd: number): number {
+  const { gy, march } = jalCal(jy);
+  return g2d(gy, 3, march) + (jm - 1) * 31 - div(jm, 7) * (jm - 7) + jd - 1;
+}
+
+/** Convert a Gregorian date to the Jalali (Iranian) calendar. */
+export function gregorianToJalali(gy: number, gm: number, gd: number): {
+  jy: number;
+  jm: number;
+  jd: number;
+} {
+  const target = g2d(gy, gm, gd);
+
+  // Binary-search for the Jalali year whose Farvardin 1 ≤ target.
+  let lo = 1;
+  let hi = 3000;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (j2d(mid, 1, 1) <= target) lo = mid;
+    else hi = mid - 1;
+  }
+  const jy = lo;
+  const yearStart = j2d(jy, 1, 1);
+  const isLeap = j2d(jy + 1, 1, 1) - yearStart > 365;
+
+  const daysInMonth = (m: number): number => {
+    if (m <= 6) return 31;
+    if (m <= 11) return 30;
+    return isLeap ? 30 : 29; // Esfand
+  };
+
+  let rem = target - yearStart;
+  let jm = 1;
+  while (jm <= 12 && rem >= daysInMonth(jm)) {
+    rem -= daysInMonth(jm);
+    jm++;
+  }
+  const jd = rem + 1;
+
+  return { jy, jm, jd };
+}
+
+/** Convert a Gregorian Date to Jalali */
+export function dateToJalali(d: Date): { jy: number; jm: number; jd: number } {
+  return gregorianToJalali(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate());
+}
+
 /** Format a Gregorian Date as YYYY-MM-DD (UTC) */
 export function toIsoDate(d: Date): string {
   return d.toISOString().split("T")[0]!;

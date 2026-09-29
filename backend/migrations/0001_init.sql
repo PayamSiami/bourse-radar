@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS stocks (
     sector              TEXT,
     industry_group      TEXT,
     isin                TEXT UNIQUE,
+    ins_code            TEXT UNIQUE,                    -- TSETMC numeric ID (for order book)
     shares_outstanding  BIGINT,
     is_bank             BOOLEAN NOT NULL DEFAULT FALSE,
     is_insurance        BOOLEAN NOT NULL DEFAULT FALSE,
@@ -18,7 +19,8 @@ CREATE TABLE IF NOT EXISTS stocks (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_stocks_sector ON stocks (sector);
+CREATE INDEX IF NOT EXISTS idx_stocks_sector ON stocks (sector);
+CREATE INDEX IF NOT EXISTS idx_stocks_ins_code ON stocks (ins_code);
 
 -- ── Real-time prices (time-series) ────────────────────────────────
 CREATE TABLE IF NOT EXISTS prices (
@@ -42,9 +44,11 @@ CREATE TABLE IF NOT EXISTS monthly_sales (
     sales_amount   NUMERIC(30,2),          -- میلیون ریال
     is_estimated   BOOLEAN NOT NULL DEFAULT FALSE,   -- برآوردی vs. واقعی
     source_url     TEXT,
+    detail         JSONB,                  -- structured breakdown (goods, totals, YTD)
     fetched_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (symbol, month_end)
 );
+CREATE INDEX IF NOT EXISTS idx_monthly_sales_month ON monthly_sales (month_end DESC);
 
 -- ── Quarterly financials (Codal.ir) ────────────────────────────────
 CREATE TABLE IF NOT EXISTS quarterly_financials (
@@ -63,6 +67,7 @@ CREATE TABLE IF NOT EXISTS quarterly_financials (
     fetched_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (symbol, fiscal_year, quarter)
 );
+CREATE INDEX IF NOT EXISTS idx_quarterly_period ON quarterly_financials (symbol, period_end DESC);
 
 -- ── Forward P/E calculations (append-only snapshot) ────────────────
 CREATE TABLE IF NOT EXISTS forward_pe (

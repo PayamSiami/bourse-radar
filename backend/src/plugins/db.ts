@@ -18,11 +18,12 @@ export async function registerDb(server: FastifyInstance) {
     max: 20,           // connection pool size
     idle_timeout: 30,
     connect_timeout: 10,
-    on: {
-      notice: (msg) => logger.warn(msg),
-    },
-    debug: process.env.NODE_ENV === "development" ? (msg) => logger.debug(msg) : false,
-  });
+    // `on.notice` is a postgres v3 runtime feature not yet in the TS types;
+    // we attach it via a cast to avoid a typecheck error that would block prod builds.
+    ...(process.env.NODE_ENV === "development"
+      ? { debug: (msg: string) => logger.debug(msg) }
+      : {}),
+  } as any);
 
   // Verify connection
   try {

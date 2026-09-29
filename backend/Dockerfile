@@ -25,9 +25,9 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/migrations ./migrations
 COPY --from=builder /app/src ./src
 
-EXPOSE 3001
+EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "const http=require('http');http.get('http://localhost:3001/health',r=>{if(r.statusCode===200)process.exit(0);process.exit(1)}).on('error',()=>process.exit(1))"
+  CMD node -e "const http=require('http');http.get('http://localhost:8000/health',r=>{if(r.statusCode===200)process.exit(0);process.exit(1)}).on('error',()=>process.exit(1))"
 
 CMD ["node", "dist/index.js"]

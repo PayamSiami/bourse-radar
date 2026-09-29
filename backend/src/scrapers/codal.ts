@@ -12,6 +12,7 @@
  * All dates from Codal use Persian digits (۰-۹); we normalize to ASCII.
  */
 
+import { jalaliToGregorian, toIsoDate } from "#utils/jalali";
 import { chromium, type Browser } from "playwright";
 
 const UA =
@@ -29,19 +30,153 @@ const H = {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// Global rate limiting
+// ═══════════════════════════════════════════════════════════════
+// Codal throttles aggressively and answers 429 with a useless body
+// ("The custom error module does not recognize this error"). A single
+// archive backfill fires 20 paginated searches plus one fetch per
+// report, which reliably trips it.
+//
+// This is a token bucket with capacity 1: every call takes a minimum
+// slot, and the next call cannot start until minIntervalMs has passed
+// since the previous one STARTED. Calls are serialized, so concurrent
+// ingest workers queue instead of bursting.
+//
+// 429/5xx are retried with exponential backoff + jitter, honouring
+// `Retry-After` when Codal sends it.
+
+/** HTTP error carrying the status, so the limiter can decide to retry. */
+export class CodalHttpError extends Error {
+  readonly status: number;
+  readonly retryAfterMs: number | null;
+
+  constructor(status: number, message: string, retryAfterMs: number | null = null) {
+    super(message);
+    this.name = "CodalHttpError";
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Parse `Retry-After`, which may be delta-seconds or an HTTP date. */
+function parseRetryAfter(res: Response): number | null {
+  const raw = res.headers.get("retry-after");
+  if (!raw) return null;
+
+  const secs = Number(raw);
+  if (Number.isFinite(secs) && secs >= 0) return secs * 1000;
+
+  const when = Date.parse(raw);
+  if (!Number.isNaN(when)) return Math.max(0, when - Date.now());
+
+  return null;
+}
+
+class RateLimiter {
+  /** Tail of the serialization chain. */
+  private chain: Promise<unknown> = Promise.resolve();
+  /** Earliest time the next request may start. */
+  private nextSlotAt = 0;
+  private readonly minIntervalMs: number;
+  private readonly maxAttempts: number;
+
+  constructor(minIntervalMs: number, maxAttempts = 5) {
+    this.minIntervalMs = minIntervalMs;
+    this.maxAttempts = maxAttempts;
+  }
+
+  /**
+   * Run `fn` under the bucket, retrying rate-limit / server errors.
+   * `fn` must throw {@link CodalHttpError} for a retryable status.
+   */
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.chain.then(
+      () => this.execute(fn),
+      () => this.execute(fn),
+    );
+    // Keep the chain alive regardless of this call's outcome.
+    this.chain = result.catch(() => undefined);
+    return result;
+  }
+
+  private async execute<T>(fn: () => Promise<T>): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+      const waitFor = this.nextSlotAt - Date.now();
+      if (waitFor > 0) await sleep(waitFor);
+      this.nextSlotAt = Date.now() + this.minIntervalMs;
+
+      try {
+        return await fn();
+      } catch (e) {
+        const status = e instanceof CodalHttpError ? e.status : 0;
+        const retryable = status === 429 || (status >= 500 && status < 600);
+        if (!retryable || attempt >= this.maxAttempts) throw e;
+
+        // Exponential backoff + jitter, but never shorter than the server's ask.
+        const backoff = Math.min(30_000, 1_000 * 2 ** (attempt - 1));
+        const jitter = backoff * 0.25 * Math.random();
+        const wait =
+          e instanceof CodalHttpError && e.retryAfterMs != null
+            ? Math.max(backoff + jitter, e.retryAfterMs)
+            : backoff + jitter;
+
+        console.warn(
+          `  [codal] HTTP ${status} — retry ${attempt}/${this.maxAttempts} in ${Math.round(wait)}ms`,
+        );
+        await sleep(wait);
+      }
+    }
+  }
+}
+
+/** Search API (`search.codal.ir`) — the endpoint that returns 429. */
+const searchLimiter = new RateLimiter(300);
+/** Report pages (`www.codal.ir`) — different host, same courtesy. */
+const reportLimiter = new RateLimiter(300);
+
+// ═══════════════════════════════════════════════════════════════
 // Browser singleton — for quarterly income statements only
 // ═══════════════════════════════════════════════════════════════
 
 let browserInstance: Browser | null = null;
+/** In-flight launch, so concurrent callers share one Chrome instead of racing. */
+let browserLaunch: Promise<Browser> | null = null;
+/**
+ * Set when a launch fails in a way that will not fix itself on retry
+ * (e.g. `spawn EPERM` from a sandbox). Without this, every letter in a
+ * backfill retries a doomed launch and floods the log with the same error.
+ */
+let browserUnavailable: string | null = null;
 
 async function getBrowser(): Promise<Browser> {
-  if (!browserInstance) {
-    browserInstance = await chromium.launch({
-      headless: true,
-      channel: "chrome", // fallback: "msedge"
+  if (browserInstance) return browserInstance;
+  if (browserUnavailable) throw new Error(browserUnavailable);
+  if (browserLaunch) return browserLaunch;
+
+  browserLaunch = chromium
+    .launch({ headless: true, channel: "chrome" }) // fallback: "msedge"
+    .then((b) => {
+      browserInstance = b;
+      browserUnavailable = null;
+      return b;
+    })
+    .finally(() => {
+      browserLaunch = null;
     });
+
+  try {
+    return await browserLaunch;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // EPERM/ENOENT/EACCES are environmental — the process cannot spawn
+    // Chrome here, so stop rather than retry per letter.
+    if (/spawn (EPERM|ENOENT|EACCES)|not found|access is denied/i.test(msg)) {
+      browserUnavailable = `Browser unavailable: ${msg.split("\n")[0]}`;
+    }
+    browserInstance = null;
+    throw e;
   }
-  return browserInstance;
 }
 
 export async function closeBrowser(): Promise<void> {
@@ -70,6 +205,8 @@ export interface CodalLetter {
 
 export interface QuarterlyFinancials {
   periodEnds: string[];
+  /** Cumulative duration in months per column (3/6/9/12); 0 = unknown. */
+  durationMonths: number[];
   revenues: Array<number | null>;
   netProfits: Array<number | null>;
   eps: Array<number | null>;
@@ -187,26 +324,32 @@ export async function searchLetters(
     if (v === null || v === undefined || v === "") continue;
     q.append(k, String(v));
   }
-  const res = await fetch(`${CODAL_SEARCH}/v2/q?${q.toString()}`, {
-    headers: H,
+  return searchLimiter.run(async () => {
+    const res = await fetch(`${CODAL_SEARCH}/v2/q?${q.toString()}`, {
+      headers: H,
+    });
+    if (!res.ok) {
+      const text = (await res.text()).slice(0, 200);
+      throw new CodalHttpError(
+        res.status,
+        `Codal ${res.status}: ${text}`,
+        parseRetryAfter(res),
+      );
+    }
+    const data = (await res.json()) as { Letters?: Record<string, unknown>[] };
+    return (data.Letters ?? []).map((l) => ({
+      tracingNo: Number(l.TracingNo ?? 0),
+      symbol: String(l.Symbol ?? ""),
+      companyName: String(l.CompanyName ?? ""),
+      title: String(l.Title ?? ""),
+      letterCode: String(l.LetterCode ?? ""),
+      publishDateTime: String(l.PublishDateTime ?? ""),
+      url: String(l.Url ?? ""),
+      hasHtml: Boolean(l.HasHtml),
+      hasPdf: Boolean(l.HasPdf),
+      hasExcel: Boolean(l.HasExcel),
+    }));
   });
-  if (!res.ok) {
-    const text = (await res.text()).slice(0, 200);
-    throw new Error(`Codal ${res.status}: ${text}`);
-  }
-  const data = (await res.json()) as { Letters?: Record<string, unknown>[] };
-  return (data.Letters ?? []).map((l) => ({
-    tracingNo: Number(l.TracingNo ?? 0),
-    symbol: String(l.Symbol ?? ""),
-    companyName: String(l.CompanyName ?? ""),
-    title: String(l.Title ?? ""),
-    letterCode: String(l.LetterCode ?? ""),
-    publishDateTime: String(l.PublishDateTime ?? ""),
-    url: String(l.Url ?? ""),
-    hasHtml: Boolean(l.HasHtml),
-    hasPdf: Boolean(l.HasPdf),
-    hasExcel: Boolean(l.HasExcel),
-  }));
 }
 
 export function filterMonthlySalesLetters(
@@ -436,6 +579,7 @@ export function extractMonthlyReport(
     ? `${jalali.jy}/${String(jalali.jm).padStart(2, "0")}/${String(jalali.jd).padStart(2, "0")}`
     : null;
 
+  const serviceRow = totals.find((t) => t.rowCode === 11);
   return {
     periodEnd,
     goods: products,
@@ -445,6 +589,7 @@ export function extractMonthlyReport(
     priorYtdSalesTotal: totalRow?.valuePriorYtd ?? null,
     domesticMonthly: domRow?.valuePeriod ?? null,
     exportMonthly: expRow?.valuePeriod ?? null,
+    serviceMonthly: serviceRow?.valuePeriod ?? null,
   };
 }
 
@@ -461,15 +606,29 @@ export function extractIncomeStatement(
   if (!tableMatch) return null;
   const tableHtml = tableMatch[0];
 
-  // ── Parse header: period-end dates ──
+  // ── Parse header: period-end dates + cumulative duration (months) ──
+  // Codal income-statement columns are CUMULATIVE year-to-date figures:
+  //   "دوره 3 ماهه منتهی به 1405/03/31"  → 3 months  (Q1)
+  //   "دوره 6 ماهه منتهی به 1405/06/31"  → 6 months  (H1 = Q1+Q2)
+  //   "دوره 9 ماهه …"                     → 9 months  (9M)
+  //   "دوره 12 ماهه …"                    → 12 months (FY)
+  // We need `durationMonths` to difference cumulative values into
+  // discrete single-quarter figures — otherwise a 6-month column gets
+  // mislabelled as "Q1" by period-end month alone.
   const periodEnds: string[] = [];
+  const durationMonths: number[] = [];
   const headerRe =
     /<th[^>]*>\s*<span[^>]*>([^<]*(?:دوره|تجديد|تجدید)[^<]*)<\/span>/g;
   let hm: RegExpExecArray | null;
   while ((hm = headerRe.exec(tableHtml)) !== null) {
     const txt = toAsciiDigits(hm[1]!.trim());
     const dm = txt.match(/(\d{4})\/(\d{2})\/(\d{2})/);
-    if (dm) periodEnds.push(`${dm[1]}/${dm[2]}/${dm[3]}`);
+    if (!dm) continue;
+    periodEnds.push(`${dm[1]}/${dm[2]}/${dm[3]}`);
+
+    // Capture the month count: "3 ماهه" / "6 ماهه" / "9 ماهه" / "12 ماهه"
+    const monMatch = txt.match(/(\d{1,2})\s*ماهه/);
+    durationMonths.push(monMatch ? parseInt(monMatch[1]!, 10) : 0);
   }
 
   const parseNumberCell = (raw: string): number | null => {
@@ -629,6 +788,7 @@ export function extractIncomeStatement(
 
   return {
     periodEnds,
+    durationMonths,
     revenues,
     netProfits,
     eps,
@@ -649,14 +809,23 @@ export async function fetchReportHtml(relativeUrl: string): Promise<string> {
   const url = relativeUrl.startsWith("/")
     ? `${CODAL_BASE}${relativeUrl}`
     : `${CODAL_BASE}/${relativeUrl}`;
-  const res = await fetch(url, {
-    headers: {
-      ...H,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
+
+  return reportLimiter.run(async () => {
+    const res = await fetch(url, {
+      headers: {
+        ...H,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+    });
+    if (!res.ok) {
+      throw new CodalHttpError(
+        res.status,
+        `Codal report fetch ${res.status}: ${url}`,
+        parseRetryAfter(res),
+      );
+    }
+    return res.text();
   });
-  if (!res.ok) throw new Error(`Codal report fetch ${res.status}: ${url}`);
-  return res.text();
 }
 
 /**
@@ -718,34 +887,159 @@ async function fetchIncomeStatementHtml(relativeUrl: string): Promise<string> {
   }
 }
 
+// ─── codal.ts ────────────────────────────────────────────────
+
+export interface MonthlySalesFull {
+  period: string; // "1402/06/31"
+  periodEnd: { jy: number; jm: number; jd: number };
+  domestic: number;
+  export: number;
+  service: number;
+  ytdTotal: number | null;
+  ytdPriorYearTotal: number | null;
+  total: number;
+  url: string;
+  revision: boolean;
+  reportDate: string; // ISO Gregorian
+  detail: ReturnType<typeof extractMonthlyReport> | null;
+}
+
+/**
+ * Row codes in Codal's monthly-activity table (metaTableCode = 1197):
+ *   4  → goods (per-product rows, rowSequence split)
+ *   5  → جمع فروش داخلی        (domestic total)
+ *   8  → جمع فروش صادراتی      (export total)
+ *   11 → جمع فروش خدمات        (services total)   ← add this
+ *   14 → جمع درآمد عملیاتی     (operating revenue total, sometimes blank)
+ *   15 → سایر درآمدها
+ *   16 → جمع درآمدها           (grand total)
+ *
+ * Column codes:
+ *   14 → quantity this month
+ *   17 → value this month       (Rial, "million Rial" in Codal UI)
+ *   18 → quantity YTD
+ *   21 → value YTD
+ *   22 → quantity prior YTD
+ *   25 → value prior YTD
+ */
+const ROW = {
+  DOMESTIC: 5,
+  EXPORT: 8,
+  SERVICE: 11,
+  OPERATING: 14,
+  OTHER: 15,
+  TOTAL: 16,
+} as const;
+
+const COL = {
+  QTY_MONTH: 14,
+  VAL_MONTH: 17,
+  QTY_YTD: 18,
+  VAL_YTD: 21,
+  QTY_PRIOR_YTD: 22,
+  VAL_PRIOR_YTD: 25,
+} as const;
+
+export function extractMonthlySalesFull(
+  html: string,
+  title: string,
+  reportUrl: string,
+  publishDateTime: string,
+): MonthlySalesFull | null {
+  const cells = extractCellsForTable(html, 1197);
+  if (cells.length === 0) return null;
+
+  const val = (rc: number, col: number): number | null => {
+    const cell = cells.find((c) => c.rowCode === rc && c.columnCode === col);
+    if (!cell || !cell.value) return null;
+    const s = cell.value.trim();
+    if (!/^-?\d+$/.test(s)) return null;
+    return parseInt(s, 10);
+  };
+
+  const domestic = val(ROW.DOMESTIC, COL.VAL_MONTH) ?? 0;
+  const exportAmt = val(ROW.EXPORT, COL.VAL_MONTH) ?? 0;
+  const service = val(ROW.SERVICE, COL.VAL_MONTH) ?? 0;
+
+  // Prefer the grand-total row if it exists; otherwise sum the three legs.
+  const grandTotal = val(ROW.TOTAL, COL.VAL_MONTH);
+  const total = grandTotal ?? domestic + exportAmt + service;
+
+  const ytdTotal = val(ROW.TOTAL, COL.VAL_YTD);
+  const ytdPriorYearTotal = val(ROW.TOTAL, COL.VAL_PRIOR_YTD);
+
+  const periodEnd = extractJalaliPeriodEnd(title);
+  if (!periodEnd) return null;
+
+  const revision = title.includes("اصلاحیه") || /اصلاحیه/.test(title);
+
+  const reportDate = toIsoDate(
+    jalaliToGregorian(periodEnd.jy, periodEnd.jm, periodEnd.jd),
+  );
+
+  return {
+    period: `${periodEnd.jy}/${String(periodEnd.jm).padStart(2, "0")}/${String(periodEnd.jd).padStart(2, "0")}`,
+    periodEnd,
+    domestic,
+    export: exportAmt,
+    service,
+    ytdTotal,
+    ytdPriorYearTotal,
+    total,
+    url: reportUrl,
+    revision,
+    reportDate,
+    detail: extractMonthlyReport(html, title),
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Public fetchers
 // ═══════════════════════════════════════════════════════════════
+
+export interface MonthlyReportResult {
+  periodEnd: { jy: number; jm: number; jd: number };
+  amount: number;
+  reportUrl: string;
+  detail: ReturnType<typeof extractMonthlyReport> | null;
+  /** NEW: full row for the USD conversion pipeline */
+  full?: MonthlySalesFull;
+}
 
 export async function fetchMonthlySales(
   symbol: string,
   count = 3,
 ): Promise<MonthlyReportResult[]> {
   const letters = await searchLetters(symbol);
-  const monthly = filterMonthlySalesLetters(letters);
+  const monthly = filterMonthlySalesLetters(letters); // keep اصلاحیه out of
+  // ...but if you want to ingest revisions too, drop the !title.includes("اصلاحیه")
+  // filter and let the DB upsert decide.
+
   const results: MonthlyReportResult[] = [];
 
   for (const letter of monthly.slice(0, count)) {
     const period = extractJalaliPeriodEnd(letter.title);
     if (!period) continue;
+
     try {
       const html = await fetchReportHtml(letter.url);
-      const amount = extractMonthlySalesAmount(html);
       const detail = extractMonthlyReport(html, letter.title);
-      if (amount && amount > 0) {
-        results.push({
-          periodEnd: period,
-          amount,
-          reportUrl: `${CODAL_BASE}${letter.url}`,
-          detail,
-        });
-      }
-    } catch (e: unknown) {
+      const full = extractMonthlySalesFull(
+        html,
+        letter.title,
+        `${CODAL_BASE}${letter.url}`,
+        letter.publishDateTime,
+      );
+      if (!full) continue;
+
+      results.push({
+        periodEnd: period,
+        amount: full.total,
+        reportUrl: full.url,
+        detail,
+        full,
+      });
+    } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.warn(
         `  [${symbol}] Codal report parse failed: ${msg.slice(0, 100)}`,
@@ -758,15 +1052,25 @@ export async function fetchMonthlySales(
 export async function fetchQuarterlyFinancials(
   symbol: string,
 ): Promise<QuarterlyResult | null> {
-  const letters = await searchLetters(symbol, { LetterType: "6" });
-  const filtered = letters.filter(
+  // Paginate through Codal search to find ALL quarterly income statements
+  // (not just page 1). Codal caps at 20 letters per page.
+  const allLetters: CodalLetter[] = [];
+  for (let page = 1; page <= 20; page++) {
+    const letters = await searchLetters(symbol, { LetterType: "6", PageNumber: String(page) });
+    if (letters.length === 0) break;
+    allLetters.push(...letters);
+    if (letters.length < 20) break;
+  }
+
+  const filtered = allLetters.filter(
     (l) =>
       (l.title.includes("صورت") || l.title.includes("مالی")) &&
       !l.title.includes("اصلاحیه") &&
       !l.title.includes("تفسیری"),
   );
 
-  for (const letter of filtered.slice(0, 3)) {
+  // Try letters newest-first; return the first that parses successfully.
+  for (const letter of filtered) {
     try {
       const html = await fetchIncomeStatementHtml(letter.url);
       const fin = extractIncomeStatement(html);
@@ -783,6 +1087,15 @@ export async function fetchQuarterlyFinancials(
       console.warn(
         `  [${symbol}] quarterly parse failed: ${msg.slice(0, 100)}`,
       );
+      // The browser itself is unusable (sandbox / no Chrome). Trying the
+      // remaining letters would only repeat the same failure, so stop here
+      // rather than emitting one identical error per letter.
+      if (/^Browser unavailable:/.test(msg)) {
+        console.warn(
+          `  [${symbol}] skipping remaining ${filtered.length - filtered.indexOf(letter) - 1} letters — browser cannot launch`,
+        );
+        return null;
+      }
     }
   }
   return null;

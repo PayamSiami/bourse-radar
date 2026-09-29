@@ -25,10 +25,14 @@ export async function registerPlugins(server: FastifyInstance) {
   } catch (err) {
     logger.warn({ err }, "Redis plugin failed — caching disabled");
   }
+
   try {
     await registerCors(server);
   } catch (err) {
-    logger.warn({ err }, "CORS plugin failed — cross-origin requests may be blocked");
+    logger.warn(
+      { err },
+      "CORS plugin failed — cross-origin requests may be blocked",
+    );
   }
   try {
     await registerRateLimit(server);

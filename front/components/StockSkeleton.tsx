@@ -1,6 +1,6 @@
 export default function StockSkeleton() {
   return (
-    <div className="rounded-2xl bg-zinc-900/50 border border-zinc-800/80 p-5 flex flex-col gap-4">
+    <div className="rounded-2xl bg-surface border border-app p-5 flex flex-col gap-4">
       <div className="flex justify-between">
         <div className="space-y-2">
           <div className="h-5 w-20 rounded skeleton" />
@@ -16,7 +16,7 @@ export default function StockSkeleton() {
         <div className="h-8 w-24 rounded skeleton" />
         <div className="h-6 w-16 rounded skeleton" />
       </div>
-      <div className="grid grid-cols-3 gap-2 pt-3 border-t border-zinc-800/80">
+      <div className="grid grid-cols-3 gap-2 pt-3 border-t border-app">
         {[0, 1, 2].map((i) => <div key={i} className="h-8 rounded skeleton" />)}
       </div>
     </div>

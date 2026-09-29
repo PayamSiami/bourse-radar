@@ -1,14 +1,6 @@
 /**
  * Bourse Radar — Background Job Scheduler
  * Tehran Stock Exchange data ingestion via node-cron
- *
- * Schedules:
- *   - Daily symbol + sector refresh (before market open)
- *   - Price scraping every 5 min (during market hours)
- *   - Monthly sales + quarterly financials (daily after market close)
- *   - Forward P/E recalculation (daily + every 4 hours)
- *   - Ranking refresh (daily + every 4 hours)
- *   - LLM narrative generation (daily for top-20 stocks)
  */
 
 import cron from "node-cron";
@@ -16,96 +8,123 @@ import type { FastifyInstance } from "fastify";
 import { logger } from "#utils/logger";
 import {
   scrapeAllSymbols,
+  fetchCurrentPrices,
   upsertStocks,
   insertPrices,
   syncMonthlySales,
+  syncQuarterlyFinancials,
   recomputeForwardPe,
   refreshRankings,
+  syncFxRates,
+  syncMarketCapHistory,
   WATCHLIST,
 } from "#services/ingest";
 
-// Iranian TSE market hours: Sunday 9:00 AM – Thursday 12:30 PM (IRST)
-// Cron uses local time (Asia/Tehran) — server must be TZ=Asia/Tehran
+const TZ = "Asia/Tehran";
 
 interface JobConfig {
   name: string;
-  schedule: string;  // cron expression
+  schedule: string;
   task: () => Promise<void>;
 }
 
 export async function initializeJobs(server: FastifyInstance): Promise<void> {
+  const symbols = WATCHLIST.map((w) => w.sym);
+
   const jobs: JobConfig[] = [
-    // ── Market data ingestion ──
+    // ── 0. FX rate (daily at 6:01 AM — before other jobs need USD conversion) ──
     {
-      name: "ingest-symbols",
-      schedule: "0 6 * * 0",  // Daily at 6:00 AM (before market open)
+      name: "ingest-fx-rate",
+      schedule: "1 6 * * *",
       task: async () => {
-        logger.info("[job] ingesting symbol list from TSETMC");
-        const symbols = await scrapeAllSymbols();
-        const n = await upsertStocks(server.db, symbols);
-        logger.info(`[job] upserted ${n} stocks`);
-      },
-    },
-    {
-      name: "ingest-prices",
-      schedule: "*/5 9-12 * * 0-4",  // Every 5 min, Sun-Thu, 9:00-12:30 IRST
-      task: async () => {
-        logger.info("[job] ingesting real-time prices from TSETMC");
-        const symbols = await scrapeAllSymbols();
-        const n = await insertPrices(server.db, symbols);
-        logger.info(`[job] inserted ${n} price ticks`);
-      },
-    },
-    {
-      name: "ingest-monthly-sales",
-      schedule: "0 14 * * 0-4",  // Daily at 2:00 PM (after Codal publications)
-      task: async () => {
-        logger.info("[job] ingesting monthly sales from Codal.ir");
-        const n = await syncMonthlySales(server.db, WATCHLIST.map((w) => w.sym));
-        logger.info(`[job] synced ${n} monthly sales records`);
-      },
-    },
-    {
-      name: "ingest-quarterly-financials",
-      schedule: "0 15 * * 0-4",  // Daily at 3:00 PM
-      task: async () => {
-        logger.info("[job] ingesting quarterly financials from Codal.ir");
-        // Quarterly financials come from the same decision.aspx reports;
-        // a dedicated parser for quarterly letters can be added later.
-        logger.info("[job] quarterly financials: no dedicated source yet — skipped");
+        logger.info("[job] fetching USD/IRR rate from Wallex + Nobitex");
+        const n = await syncFxRates(server.db);
+        logger.info(`[job] FX rate stored (${n > 0 ? "ok" : "failed"})`);
       },
     },
 
-    // ── Processing ──
+    // ── 1. Daily symbol + sector refresh (every day at 6 AM) ──
+    {
+      name: "ingest-symbols",
+      schedule: "0 6 * * *",
+      task: async () => {
+        logger.info("[job] ingesting symbol list from TSETMC");
+        const s = await scrapeAllSymbols();
+        const n = await upsertStocks(server.db, s);
+        logger.info(`[job] upserted ${n} stocks`);
+      },
+    },
+
+    // ── 2. Price ticks every 5 min during market hours ──
+    {
+      name: "ingest-prices",
+      schedule: "*/5 9-12 * * 0-4",
+      task: async () => {
+        logger.info("[job] ingesting real-time prices");
+        const s = await fetchCurrentPrices(server.db);
+        const n = await insertPrices(server.db, s);
+        logger.info(`[job] inserted ${n} price ticks`);
+      },
+    },
+
+    // ── 2b. Market-cap history (daily at 6:30 AM, uses prices + fx) ──
+    {
+      name: "ingest-market-cap-history",
+      schedule: "30 6 * * *",
+      task: async () => {
+        logger.info("[job] building market-cap history from TSETMC prices");
+        const n = await syncMarketCapHistory(server.db);
+        logger.info(`[job] ${n} market-cap points stored`);
+      },
+    },
+
+    // ── 3. Monthly sales (daily at 2 PM, after Codal publications) ──
+    {
+      name: "ingest-monthly-sales",
+      schedule: "0 14 * * 0-4",
+      task: async () => {
+        logger.info("[job] ingesting monthly sales from Codal.ir");
+        const n = await syncMonthlySales(server.db, symbols);
+        logger.info(`[job] synced ${n} monthly sales records`);
+      },
+    },
+
+    // ── 4. Quarterly financials (daily at 3 PM, Playwright-heavy, 10-15 min) ──
+    {
+      name: "ingest-quarterly-financials",
+      schedule: "0 15 * * 0-4",
+      task: async () => {
+        logger.info("[job] ingesting quarterly financials (Playwright)");
+        const n = await syncQuarterlyFinancials(server.db, symbols);
+        logger.info(`[job] synced ${n} quarterly records`);
+      },
+    },
+
+    // ── 5. Forward P/E (daily at 8 PM, after all data is fresh) ──
     {
       name: "compute-forward-pe",
-      schedule: "0 20 * * *",  // Daily at 8:00 PM (after market close)
+      schedule: "0 20 * * *",
       task: async () => {
         logger.info("[job] computing Forward P/E for all stocks");
         const n = await recomputeForwardPe(server.db);
         logger.info(`[job] computed Forward P/E for ${n} stocks`);
       },
     },
-    {
-      name: "compute-forward-pe-intraday",
-      schedule: "0 11,15 * * 0-4",  // Every 4 hours during market
-      task: async () => {
-        logger.info("[job] re-computing Forward P/E (intraday)");
-        const n = await recomputeForwardPe(server.db);
-        logger.info(`[job] recomputed ${n} stocks`);
-      },
-    },
+
+    // ── 6. Rankings refresh (daily at 9 PM, after P/E) ──
     {
       name: "compute-rankings",
-      schedule: "0 21 * * *",  // Daily at 9:00 PM
+      schedule: "0 21 * * *",
       task: async () => {
         logger.info("[job] refreshing rankings materialized view");
         await refreshRankings(server.db);
       },
     },
+
+    // ── 7. LLM narratives (daily at 10 PM, for top-20 stocks) ──
     {
       name: "generate-narratives",
-      schedule: "0 22 * * *",  // Daily at 10:00 PM
+      schedule: "0 22 * * *",
       task: async () => {
         logger.info("[job] generating LLM narratives for top-20 stocks");
         // TODO: call LlmNarrator for top-20 ranked stocks
@@ -114,18 +133,23 @@ export async function initializeJobs(server: FastifyInstance): Promise<void> {
   ];
 
   for (const job of jobs) {
-    cron.schedule(job.schedule, async () => {
-      try {
-        await job.task();
-        logger.info(`[job] ${job.name} completed successfully`);
-      } catch (err) {
-        logger.error(err, `[job] ${job.name} failed`);
-      }
-    });
-    logger.info(`[job] ${job.name} scheduled: ${job.schedule}`);
+    cron.schedule(
+      job.schedule,
+      async () => {
+        const startedAt = Date.now();
+        try {
+          await job.task();
+          const ms = Date.now() - startedAt;
+          logger.info(`[job] ${job.name} completed in ${ms}ms`);
+        } catch (err) {
+          logger.error(err, `[job] ${job.name} failed`);
+        }
+      },
+      { timezone: TZ },
+    );
+    logger.info(`[job] ${job.name} scheduled: ${job.schedule} (${TZ})`);
   }
 
-  // Graceful shutdown: stop all cron jobs
   server.addHook("onClose", () => {
     cron.getTasks().forEach((t) => t.stop());
     logger.info("All cron jobs stopped");
