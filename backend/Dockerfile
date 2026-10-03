@@ -1,33 +1,51 @@
-FROM node:20-alpine AS builder
+# syntax=docker/dockerfile:1.7
 
+# ── Build stage ──────────────────────────────────────────────
+FROM node:22-alpine AS builder
 WORKDIR /app
 
-COPY package.json pnpm-lock.yaml* ./
-COPY tsconfig.json ./
-RUN npm ci --omit=dev 2>/dev/null || npm ci 2>/dev/null || true
+# Install deps first for better layer caching
+COPY package.json package-lock.json* ./
+RUN npm ci --ignore-scripts
 
+# Copy source + migrations
+COPY tsconfig.json ./
 COPY src ./src
-COPY tests ./tests
 COPY migrations ./migrations
 
-RUN npx tsc --noEmit || true
+# Build: tsc compiles src/ -> dist/. With rootDir=".", output is dist/src/*.js
+# so dist/src/index.js is the entrypoint (NOT dist/index.js).
 RUN npm run build
 
-FROM node:20-alpine AS runner
-
+# ── Runtime stage ────────────────────────────────────────────
+FROM node:22-alpine AS runner
 WORKDIR /app
+
+# Needed for signal handling and healthcheck wget fallback
+RUN apk add --no-cache dumb-init
 
 ENV NODE_ENV=production
 ENV TZ=Asia/Tehran
 
-COPY package.json ./
+# Only production deps
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/migrations ./migrations
-COPY --from=builder /app/src ./src
+# package.json is needed at runtime for Node ESM subpath imports resolution
+COPY package.json ./
+
+# Run as non-root
+RUN addgroup -S appgroup && adduser -S -G appgroup appuser \
+  && chown -R appuser:appgroup /app
+USER appuser
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "const http=require('http');http.get('http://localhost:8000/health',r=>{if(r.statusCode===200)process.exit(0);process.exit(1)}).on('error',()=>process.exit(1))"
+# Healthcheck hits /api/health (the real route — /health returns 404)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "const h=require('http');h.get('http://127.0.0.1:8000/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
-CMD ["node", "dist/index.js"]
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "dist/src/index.js"]

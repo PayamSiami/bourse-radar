@@ -25,6 +25,10 @@ const schema = z.object({
   CODAL_BASE_URL: z.string().url().default("https://www.codal.ir"),
   USER_AGENT: z.string().default("BourseRadar/0.1 (+https://bourse-radar.ir)"),
 
+  // CORS — comma-separated list of allowed origins in production.
+  // Default keeps the current bourse-radar.ir + www. Add more via .env.
+  CORS_ORIGINS: z.string().default("https://bourse-radar.ir,https://www.bourse-radar.ir"),
+
   // Rate limits
   RATE_LIMIT_GLOBAL: z.coerce.number().int().default(100),
   RATE_LIMIT_GLOBAL_WINDOW: z.coerce.number().int().default(60_000),
@@ -63,6 +67,9 @@ export const config = {
     tsetmc: _env.TSETMC_BASE_URL,
     codal: _env.CODAL_BASE_URL,
     userAgent: _env.USER_AGENT,
+  },
+  cors: {
+    origins: _env.CORS_ORIGINS,
   },
   rateLimit: {
     global: _env.RATE_LIMIT_GLOBAL,
