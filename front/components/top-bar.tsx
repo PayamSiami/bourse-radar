@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import { ThemeToggle } from "./theme-toggle";
+import Image from "next/image";
 
 const NAV_ITEMS = [
   { href: "/stocks", label: "سهام" },
@@ -42,11 +43,13 @@ export function TopBar() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center gap-3 sm:gap-5">
         {/* Logo */}
         <Link href="/" className="flex items-center gap-2.5 shrink-0 group">
-          <div className="relative w-9 h-9 rounded-xl bg-linear-to-br from-brand-500 to-brand-600 flex items-center justify-center text-white shadow-sm shadow-brand-500/30 transition group-hover:shadow-md group-hover:shadow-brand-500/40">
-            <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M3 17l6-6 4 4 8-8" />
-            </svg>
-            <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-500 ring-2 ring-app" />
+          <div className="relative w-10 h-10 rounded-xl flex items-center justify-center">
+            <Image
+              alt="logo"
+              fill
+              src={"/logo.webp"}
+              sizes="10"
+            />
           </div>
           <div className="hidden sm:block">
             <div className="text-[13px] font-bold text-fg leading-tight">
@@ -68,7 +71,7 @@ export function TopBar() {
             placeholder="جستجوی نماد یا نام شرکت..."
             className="w-full h-10 px-4 pr-11 rounded-2xl bg-surface border border-app
                        focus:border-brand-500/60 focus:outline-none
-                       focus:ring-4 focus:ring-brand-500/10 text-[13px] text-fg
+                       focus:ring-1 focus:ring-brand-500/10 text-[13px] text-lg
                        placeholder:text-muted/60 transition
                        hover:border-app/80"
           />
@@ -94,7 +97,7 @@ export function TopBar() {
                 inputRef.current?.focus();
               }}
               aria-label="پاک کردن"
-              className="absolute right-10 top-1/2 -translate-y-1/2 grid h-6 w-6 place-items-center rounded-md text-muted hover:text-fg hover:bg-surface-2 transition"
+              className="absolute left-2 top-1/2 -translate-y-1/2 grid h-6 w-6 place-items-center rounded-md text-muted hover:text-fg hover:bg-surface-2 transition"
             >
               <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
                 <path d="M18 6 6 18M6 6l12 12" />
@@ -161,8 +164,8 @@ export function TopBar() {
                   href={item.href}
                   onClick={() => setMobileOpen(false)}
                   className={`px-3 py-3 rounded-xl text-sm transition flex items-center justify-between ${active
-                      ? "text-brand-600 dark:text-brand-400 font-semibold bg-brand-50 dark:bg-brand-500/10"
-                      : "text-muted hover:text-fg hover:bg-surface-2"
+                    ? "text-brand-600 dark:text-brand-400 font-semibold bg-brand-50 dark:bg-brand-500/10"
+                    : "text-muted hover:text-fg hover:bg-surface-2"
                     }`}
                 >
                   <span>{item.label}</span>
@@ -194,8 +197,8 @@ function NavLink({
     <Link
       href={href}
       className={`relative px-3 py-2 rounded-lg text-xs font-medium transition ${active
-          ? "text-fg"
-          : "text-muted hover:text-fg hover:bg-surface-2"
+        ? "text-fg"
+        : "text-muted hover:text-fg hover:bg-surface-2"
         }`}
     >
       {children}

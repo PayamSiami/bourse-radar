@@ -1,6 +1,14 @@
 "use client";
 
-export function Hero({ generatedAt, total }: { generatedAt?: string; total?: number }) {
+export function Hero({
+  generatedAt,
+  total,
+  stats,
+}: {
+  generatedAt?: string;
+  total?: number;
+  stats?: { avgScore: number; gainers: number; losers: number } | null;
+}) {
   return (
     <section className="brand-gradient pt-16 pb-24">
       <div className="max-w-4xl mx-auto px-4 text-center">
@@ -18,6 +26,7 @@ export function Hero({ generatedAt, total }: { generatedAt?: string; total?: num
           <p className="text-xs text-muted mt-6">
             آخرین به‌روزرسانی: {new Date(generatedAt).toLocaleString("fa-IR")}
             {total !== undefined && ` · ${total.toLocaleString("fa-IR")} نماد`}
+            {stats && ` · میانگین امتیاز ${stats.avgScore} · ${stats.gainers}▲ / ${stats.losers}▼`}
           </p>
         )}
       </div>

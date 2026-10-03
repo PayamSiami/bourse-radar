@@ -15,9 +15,17 @@ import { registerPlugins } from "#plugins/index";
 import { registerRoutes } from "#routes/index";
 import { initializeJobs } from "#jobs/index";
 
+/**
+ * A stray rejection must NOT take the API down.
+ *
+ * Background ingestion fans out across many symbols against rate-limited
+ * upstreams (Codal returns 429 under load), so a single orphaned promise was
+ * enough to kill the whole server via `process.exit(1)` — taking every read
+ * endpoint offline while a supervisor restarted it. Log loudly instead; an
+ * `uncaughtException` still exits, since that leaves state undefined.
+ */
 process.on("unhandledRejection", (reason) => {
-  console.error("UNHANDLED REJECTION:", reason);
-  process.exit(1);
+  console.error("UNHANDLED REJECTION (not fatal):", reason);
 });
 
 process.on("uncaughtException", (err) => {
@@ -30,7 +38,10 @@ async function buildServer() {
     logger: {
       level: config.app.logLevel,
     },
-    ignoreTrailingSlash: true,   // /api/stocks == /api/stocks/
+    // /api/stocks == /api/stocks/
+    // Must live under routerOptions: the top-level `ignoreTrailingSlash` is
+    // deprecated (FSTDEP022) and removed in fastify@6.
+    routerOptions: { ignoreTrailingSlash: true },
   });
 
   await registerPlugins(server);

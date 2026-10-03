@@ -1,5 +1,6 @@
 // backend/src/routes/earnings.ts
 import type { FastifyInstance } from "fastify";
+import { getOrSet } from "#utils/cache";
 
 export async function registerEarningsRoutes(
   server: FastifyInstance,
@@ -63,7 +64,12 @@ export async function registerEarningsRoutes(
       const { symbol } = req.params as { symbol: string };
       const sym = decodeURIComponent(symbol);
 
-      const rows = await server.db<
+      const { data, hit } = await getOrSet(
+        server,
+        `earnings:${sym}`,
+        300,
+        async () => {
+          const rows = await server.db<
         {
           period_end: Date;
           fiscal_year: number;
@@ -119,22 +125,27 @@ export async function registerEarningsRoutes(
             100
           : null;
 
-      return reply.send({
-        symbol: sym,
-        quarterly,
-        summary: {
-          latest_eps: latest?.eps_rials ?? null,
-          latest_margin: latest?.net_margin ?? null,
-          eps_growth_yoy: epsGrowthYoy,
-          net_profit_growth_yoy: netProfitGrowthYoy,
-          dividend_per_share: null,
-          dividend_payout_ratio: null,
+          return {
+            symbol: sym,
+            quarterly,
+            summary: {
+              latest_eps: latest?.eps_rials ?? null,
+              latest_margin: latest?.net_margin ?? null,
+              eps_growth_yoy: epsGrowthYoy,
+              net_profit_growth_yoy: netProfitGrowthYoy,
+              dividend_per_share: null,
+              dividend_payout_ratio: null,
+            },
+            meta: {
+              count: quarterly.length,
+              generatedAt: new Date().toISOString(),
+            },
+          };
         },
-        meta: {
-          count: quarterly.length,
-          generatedAt: new Date().toISOString(),
-        },
-      });
+      );
+
+      reply.header("x-cache", hit ? "HIT" : "MISS");
+      return reply.send(data);
     },
   );
 }

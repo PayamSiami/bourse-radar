@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { getOrSet } from "#utils/cache";
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -79,9 +80,15 @@ export async function registerSectorAssetsRoutes(
     async (req, reply) => {
       const { sector } = req.params as { sector: string };
       const sectorName = decodeURIComponent(sector);
-
-      // Get previous month for MoM calc
-      const months = await server.db<{ month_end: Date }[]>`
+      // 90s per-sector entry — balances freshness (mcap changes live)
+      // against avoiding 5 CTEs + two lateral joins on every click.
+      const { data, hit } = await getOrSet(
+        server,
+        `sector-assets:${sectorName}`,
+        90,
+        async () => {
+          // Get previous month for MoM calc
+          const months = await server.db<{ month_end: Date }[]>`
         SELECT DISTINCT month_end
         FROM monthly_sales
         ORDER BY month_end DESC
@@ -175,14 +182,19 @@ export async function registerSectorAssetsRoutes(
         ORDER BY market_cap DESC NULLS LAST, s.symbol ASC
       `;
 
-      return reply.send({
-        sector: sectorName,
-        data: rows,
-        meta: {
-          total: rows.length,
-          generatedAt: new Date().toISOString(),
+          return {
+            sector: sectorName,
+            data: rows,
+            meta: {
+              total: rows.length,
+              generatedAt: new Date().toISOString(),
+            },
+          };
         },
-      });
+      );
+
+      reply.header("x-cache", hit ? "HIT" : "MISS");
+      return reply.send(data);
     },
   );
 }

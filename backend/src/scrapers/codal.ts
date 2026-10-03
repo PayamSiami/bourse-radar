@@ -59,6 +59,69 @@ export class CodalHttpError extends Error {
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Shared circuit breaker across ALL Codal traffic.
+ *
+ * Codal bans by IP, and the ban is global — it hits the search host and the
+ * report host alike. Per-call retry is therefore actively harmful: a symbol
+ * that returns 429 five times is followed by the next symbol doing the same,
+ * which turns a transient throttle into a sustained ban.
+ *
+ * After `THRESHOLD` throttles inside the window we stop sending requests
+ * entirely for `COOLDOWN_MS`, so the limit window can expire instead of
+ * being extended by further traffic. `Retry-After` raises the cooldown when
+ * the server actually tells us how long to wait.
+ */
+const THRESHOLD = 6; // throttles inside the window before we stop
+const WINDOW_MS = 60_000; // rolling window for counting throttles
+const COOLDOWN_MS = 120_000; // how long we stay silent once tripped
+
+let throttleStamps: number[] = [];
+let breakerOpenUntil = 0;
+
+function noteThrottle(retryAfterMs: number | null = null): void {
+  const now = Date.now();
+  throttleStamps = throttleStamps.filter((t) => now - t < WINDOW_MS);
+  throttleStamps.push(now);
+  if (throttleStamps.length >= THRESHOLD) {
+    const until = now + Math.max(COOLDOWN_MS, retryAfterMs ?? 0);
+    breakerOpenUntil = Math.max(breakerOpenUntil, until);
+    throttleStamps = [];
+    console.warn(
+      `  [codal] circuit OPEN — pausing all Codal traffic for ${Math.ceil(
+        (breakerOpenUntil - now) / 1000,
+      )}s after ${THRESHOLD} throttles`,
+    );
+  }
+}
+
+function noteSuccess(): void {
+  // A clean call is evidence the pressure has eased.
+  if (throttleStamps.length) throttleStamps.pop();
+}
+
+/** True while we are deliberately silent so Codal can lift the ban. */
+export function isCodalCoolingDown(): boolean {
+  return Date.now() < breakerOpenUntil;
+}
+
+/** Milliseconds left on the cooldown, for surfacing in admin responses. */
+export function codalCooldownRemainingMs(): number {
+  return Math.max(0, breakerOpenUntil - Date.now());
+}
+
+/** Human-readable one-liner for logs and the admin ingest response. */
+export function codalThrottleStatus(): string {
+  const left = codalCooldownRemainingMs();
+  if (left > 0) {
+    return `cooling down ${Math.ceil(left / 1000)}s after ${THRESHOLD} throttles`;
+  }
+  return throttleStamps.length
+    ? `throttled ${throttleStamps.length}/${THRESHOLD}`
+    : "ok";
+}
+
+
 /** Parse `Retry-After`, which may be delta-seconds or an HTTP date. */
 function parseRetryAfter(res: Response): number | null {
   const raw = res.headers.get("retry-after");
@@ -78,17 +141,22 @@ class RateLimiter {
   private chain: Promise<unknown> = Promise.resolve();
   /** Earliest time the next request may start. */
   private nextSlotAt = 0;
+  private intervalMs: number;
   private readonly minIntervalMs: number;
   private readonly maxAttempts: number;
 
-  constructor(minIntervalMs: number, maxAttempts = 5) {
+  constructor(minIntervalMs: number, maxAttempts = 3) {
     this.minIntervalMs = minIntervalMs;
+    this.intervalMs = minIntervalMs;
     this.maxAttempts = maxAttempts;
   }
 
   /**
    * Run `fn` under the bucket, retrying rate-limit / server errors.
    * `fn` must throw {@link CodalHttpError} for a retryable status.
+   *
+   * While the shared breaker is open this waits it out instead of firing
+   * more traffic into an active ban.
    */
   async run<T>(fn: () => Promise<T>): Promise<T> {
     const result = this.chain.then(
@@ -102,27 +170,55 @@ class RateLimiter {
 
   private async execute<T>(fn: () => Promise<T>): Promise<T> {
     for (let attempt = 1; ; attempt++) {
-      const waitFor = this.nextSlotAt - Date.now();
-      if (waitFor > 0) await sleep(waitFor);
-      this.nextSlotAt = Date.now() + this.minIntervalMs;
+      // Respect an open breaker before spending a slot.
+      const cooling = codalCooldownRemainingMs();
+      if (cooling > 0) {
+        if (attempt === 1) {
+          console.warn(
+            `  [codal] breaker open — waiting ${Math.ceil(cooling / 1000)}s before any request`,
+          );
+          await sleep(cooling);
+        }
+        const waitFor = this.nextSlotAt - Date.now();
+        if (waitFor > 0) await sleep(waitFor);
+      } else {
+        const waitFor = this.nextSlotAt - Date.now();
+        if (waitFor > 0) await sleep(waitFor);
+      }
+      this.nextSlotAt = Date.now() + this.intervalMs;
 
       try {
-        return await fn();
+        const out = await fn();
+        noteSuccess();
+        // Back off toward the floor once we are getting through again.
+        this.intervalMs = Math.max(this.minIntervalMs, this.intervalMs * 0.9);
+        return out;
       } catch (e) {
         const status = e instanceof CodalHttpError ? e.status : 0;
+        const retryAfter =
+          e instanceof CodalHttpError ? e.retryAfterMs : null;
         const retryable = status === 429 || (status >= 500 && status < 600);
-        if (!retryable || attempt >= this.maxAttempts) throw e;
+        if (!retryable) throw e;
+
+        noteThrottle(retryAfter);
+        // Widen the gap permanently-ish while the host is unhappy.
+        this.intervalMs = Math.min(
+          5_000,
+          Math.max(this.minIntervalMs, this.intervalMs * 2),
+        );
+
+        if (attempt >= this.maxAttempts) throw e;
 
         // Exponential backoff + jitter, but never shorter than the server's ask.
-        const backoff = Math.min(30_000, 1_000 * 2 ** (attempt - 1));
+        const backoff = Math.min(30_000, 2_000 * 2 ** (attempt - 1));
         const jitter = backoff * 0.25 * Math.random();
         const wait =
-          e instanceof CodalHttpError && e.retryAfterMs != null
-            ? Math.max(backoff + jitter, e.retryAfterMs)
+          retryAfter != null
+            ? Math.max(backoff + jitter, retryAfter)
             : backoff + jitter;
 
         console.warn(
-          `  [codal] HTTP ${status} — retry ${attempt}/${this.maxAttempts} in ${Math.round(wait)}ms`,
+          `  [codal] HTTP ${status} — retry ${attempt}/${this.maxAttempts} in ${Math.round(wait)}ms (interval now ${this.intervalMs}ms)`,
         );
         await sleep(wait);
       }
@@ -130,10 +226,14 @@ class RateLimiter {
   }
 }
 
-/** Search API (`search.codal.ir`) — the endpoint that returns 429. */
-const searchLimiter = new RateLimiter(300);
+/**
+ * Search API (`search.codal.ir`) — the endpoint that returns 429.
+ * Both limiters share one breaker, because the ban is per-IP, not per-host.
+ * 1200ms is the polite floor for a single archive backfill.
+ */
+const searchLimiter = new RateLimiter(1200);
 /** Report pages (`www.codal.ir`) — different host, same courtesy. */
-const reportLimiter = new RateLimiter(300);
+const reportLimiter = new RateLimiter(1200);
 
 // ═══════════════════════════════════════════════════════════════
 // Browser singleton — for quarterly income statements only
@@ -497,6 +597,7 @@ export function extractMonthlyReport(
   priorYtdSalesTotal: number | null;
   domesticMonthly: number | null;
   exportMonthly: number | null;
+  serviceMonthly: number | null;
 } | null {
   const cells = extractCellsForTable(html, 1197);
   if (cells.length === 0) return null;

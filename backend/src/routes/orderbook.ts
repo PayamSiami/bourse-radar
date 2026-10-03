@@ -3,6 +3,35 @@ import type { FastifyInstance } from "fastify";
 
 const TSETMC_BASE = "https://cdn.tsetmc.com/api";
 
+/** One price level, shared by the bid and ask sides. */
+const levelSchema = {
+  type: "object",
+  properties: {
+    level: { type: "number" },
+    price: { type: "number" },
+    volume: { type: "number" },
+    count: { type: "number" },
+  },
+} as const;
+
+/** Response body returned for every outcome (200, 404, 502). */
+const orderBookSchema = {
+  type: "object",
+  properties: {
+    symbol: { type: "string" },
+    insCode: { type: ["string", "null"] },
+    bids: { type: "array", items: levelSchema },
+    asks: { type: "array", items: levelSchema },
+    meta: {
+      type: "object",
+      properties: {
+        fetchedAt: { type: "string" },
+        cached: { type: "boolean" },
+      },
+    },
+  },
+} as const;
+
 export async function registerOrderBookRoutes(
   server: FastifyInstance,
   prefix: string,
@@ -21,44 +50,11 @@ export async function registerOrderBookRoutes(
           properties: { symbol: { type: "string" } },
         },
         response: {
-          200: {
-            type: "object",
-            properties: {
-              symbol: { type: "string" },
-              insCode: { type: ["string", "null"] },
-              bids: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    level: { type: "number" },
-                    price: { type: "number" },
-                    volume: { type: "number" },
-                    count: { type: "number" },
-                  },
-                },
-              },
-              asks: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    level: { type: "number" },
-                    price: { type: "number" },
-                    volume: { type: "number" },
-                    count: { type: "number" },
-                  },
-                },
-              },
-              meta: {
-                type: "object",
-                properties: {
-                  fetchedAt: { type: "string" },
-                  cached: { type: "boolean" },
-                },
-              },
-            },
-          },
+          200: orderBookSchema,
+          // Both failure paths return the same shape with an `error` reason,
+          // so the client can render bids/asks as empty rather than crashing.
+          404: { ...orderBookSchema, properties: { ...orderBookSchema.properties, error: { type: "string" } } },
+          502: { ...orderBookSchema, properties: { ...orderBookSchema.properties, error: { type: "string" } } },
         },
       },
     },

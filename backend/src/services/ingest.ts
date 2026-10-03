@@ -1,36 +1,3 @@
-/**
- * Ingestion service — pulls real TSE data from TSETMC + Codal.ir
- * and persists it to PostgreSQL.
- *
- * Pipeline:
- *   Phase 1: TSETMC symbols + prices
- *   Phase 2: Codal monthly sales → monthly_sales
- *   Phase 3: Codal quarterly financials → quarterly_financials
- *   Phase 4: Forward P/E → forward_pe
- *   Phase 5: Refresh materialized view
- *
- * Fixed issues:
- *   - sp.last_price → sp2.last_price (SQL 42703)
- *   - is_bank/is_insurance/is_holding_company set from WATCHLIST
- *   - syncMonthlySales: retry + backoff + controlled concurrency
- *   - syncQuarterlyFinancials: filter margin <= 0
- *   - forward_pe pruning: uses ctid (no id column)
- *   - recomputeForwardPe: margin from quarterly_financials (real data)
- *   - Playwright browser closed in finally
- *
- * FX + USD support (Phase B–D):
- *   - fx.ts scraper (Wallex + Nobitex) with quality tagging
- *   - syncMonthlySales: USD conversion via nearest-date FX rate lookup
- *   - syncFxRates / getFxRateForDate (nearest-date with forward-fallback)
- *   - syncMarketCapHistory: prices.last_price × shares × FX → USD mcap series
- *
- * Forward P/E basis (current):
- *   - Revenue side = last 3 months of sales (≈ one quarter), annualised × 4
- *   - Margin side  = most recent reported quarterly net margin
- *   - Partial quarter → AVG(month) × 3, then × 4
- *   - Method tags: last3m_annualised | last3m_avg_annualised | *_assumed_margin
- */
-
 import postgres from "postgres";
 import { tsetmc, type ResolvedInstrument } from "#scrapers/tsetmc";
 import {
@@ -47,14 +14,24 @@ import {
   filterMonthlySalesLetters,
   fetchReportHtml,
   extractMonthlySalesFull,
+  isCodalCoolingDown,
+  codalThrottleStatus,
+  codalCooldownRemainingMs,
   type CodalLetter,
   type MonthlyReportResult,
 } from "#scrapers/codal";
+
+// Re-exported so routes/services can report throttle state without reaching
+// into the scraper module directly.
+export {
+  isCodalCoolingDown,
+  codalThrottleStatus,
+  codalCooldownRemainingMs,
+};
 import { jalaliToGregorian, toIsoDate } from "#utils/jalali";
 
 type PostgresDb = ReturnType<typeof postgres>;
 
-/** Watchlist of TSE symbols to scrape. */
 export type WatchlistType = "general" | "bank" | "insurance" | "holding";
 
 export const WATCHLIST: Array<{
@@ -63,47 +40,55 @@ export const WATCHLIST: Array<{
   type: WatchlistType;
 }> = [
   // ── فلزات اساسی (Basic Metals) ──────────────────────
-  // { sym: "فولاد", name: "فولاد مبارکه", type: "general" },
-  // { sym: "فخوز", name: "فولاد خوزستان", type: "general" },
-  // { sym: "فخاس", name: "فولاد خراسان", type: "general" },
-  // { sym: "ذوب", name: "ذوب‌آهن اصفهان", type: "general" },
-  // { sym: "فملی", name: "ملی صنایع مس ایران", type: "general" },
-  // { sym: "فایرا", name: "آلومینیوم ایران", type: "general" },
-  // { sym: "فمراد", name: "آلومراد", type: "general" },
-  // { sym: "فپارس", name: "آلومینیوم پارس", type: "general" },
-  // { sym: "فالوم", name: "آلومتک", type: "general" },
-  // { sym: "فزرین", name: "معدن زرین آسیا", type: "general" },
-  // { sym: "فجر", name: "فولاد امیرکبیر کاشان", type: "general" },
-  // { sym: "فاراک", name: "ماشین‌سازی اراک", type: "general" },
-  // { sym: "فوکا", name: "فولاد کاویان", type: "general" },
-  // { sym: "فسرب", name: "ملی سرب و روی", type: "general" },
-  // { sym: "فسبزوار", name: "پارس فولاد سبزوار", type: "general" },
-  // { sym: "فاسمین", name: "کالسیمین", type: "general" },
-  // { sym: "کروی", name: "توسعه معادن روی ایران", type: "general" },
-  // { sym: "کگل", name: "گل‌گهر", type: "general" },
-  // { sym: "کچاد", name: "چادرملو", type: "general" },
+  { sym: "فولاد", name: "فولاد مبارکه", type: "general" },
+  { sym: "فخوز", name: "فولاد خوزستان", type: "general" },
+  { sym: "فخاس", name: "فولاد خراسان", type: "general" },
+  { sym: "ذوب", name: "ذوبآهن اصفهان", type: "general" },
+  { sym: "فملی", name: "ملی صنایع مس ایران", type: "general" },
+  { sym: "فایرا", name: "آلومینیوم ایران", type: "general" },
+  { sym: "فمراد", name: "آلومراد", type: "general" },
+  { sym: "فپارس", name: "آلومینیوم پارس", type: "general" },
+  { sym: "فالوم", name: "آلومتک", type: "general" },
+  { sym: "فزرین", name: "معدن زرین آسیا", type: "general" },
+  { sym: "فجر", name: "فولاد امیرکبیر کاشان", type: "general" },
+  { sym: "فاراک", name: "ماشینسازی اراک", type: "general" },
+  { sym: "فوکا", name: "فولاد کاویان", type: "general" },
+  { sym: "فسرب", name: "ملی سرب و روی", type: "general" },
+  { sym: "فسبزوار", name: "پارس فولاد سبزوار", type: "general" },
+  { sym: "فاسمین", name: "کالسیمین", type: "general" },
+  { sym: "کروی", name: "توسعه معادن روی ایران", type: "general" },
+  { sym: "کگل", name: "گلگهر", type: "general" },
+  { sym: "کچاد", name: "چادرملو", type: "general" },
 
   // ── پالایش و پتروشیمی (Refining & Petrochemical) ────
-  // { sym: "شپنا", name: "پالایش نفت اصفهان", type: "general" },
-  // { sym: "شبندر", name: "پالایش نفت بندرعباس", type: "general" },
-  // { sym: "شتران", name: "پالایش نفت تهران", type: "general" },
-  // { sym: "شبریز", name: "پالایش نفت تبریز", type: "general" },
-  // { sym: "شپدیس", name: "پتروشیمی پردیس", type: "general" },
-  // { sym: "شیراز", name: "پتروشیمی شیراز", type: "general" },
-  // { sym: "شاراک", name: "پتروشیمی شازند", type: "general" },
-  // { sym: "شپارس", name: "بین‌المللی محصولات پارس", type: "general" },
-  // { sym: "شپاکسا", name: "پاکسان", type: "general" },
-  // { sym: "شخارک", name: "پتروشیمی خارک", type: "general" },
-  // { sym: "تاپیکو", name: "سرمایه‌گذاری نفت و گاز تامین", type: "general" },
+  { sym: "شپنا", name: "پالایش نفت اصفهان", type: "general" },
+  { sym: "شبندر", name: "پالایش نفت بندرعباس", type: "general" },
+  { sym: "شتران", name: "پالایش نفت تهران", type: "general" },
+  { sym: "شبریز", name: "پالایش نفت تبریز", type: "general" },
+  { sym: "شپدیس", name: "پتروشیمی پردیس", type: "general" },
+  { sym: "شیراز", name: "پتروشیمی شیراز", type: "general" },
+  { sym: "شاراک", name: "پتروشیمی شازند", type: "general" },
+  { sym: "شپارس", name: "بینالمللی محصولات پارس", type: "general" },
+  { sym: "شپاکسا", name: "پاکسان", type: "general" },
+  { sym: "شخارک", name: "پتروشیمی خارک", type: "general" },
+  { sym: "تاپیکو", name: "سرمایهگذاری نفت و گاز تامین", type: "general" },
 
-  // // ── خودرو (Automotive) ──────────────────────────────
-  // { sym: "خودرو", name: "ایران خودرو", type: "general" },
-  // { sym: "خساپا", name: "سایپا", type: "general" },
-  // { sym: "خپارس", name: "پارس خودرو", type: "general" },
-  // { sym: "پتایر", name: "ایران تایر", type: "general" },
-  // { sym: "پاسا", name: "ایران یاسا تایر", type: "general" },
+  // // ── شیمیایی (Chemicals) ─────────────────────────────
+  // { sym: "شکام", name: "صنایع شیمیایی کیمیاگران امروز", type: "general" },
+  { sym: "شسینا", name: "صنایع شیمیایی سینا", type: "general" },
+  { sym: "شبصیر", name: "پتروشیمی قائد بصیر", type: "general" },
+  { sym: "شغدیر", name: "پتروشیمی غدیر", type: "general" },
+  { sym: "شجم", name: "صنایع پتروشیمی تخت جمشید", type: "general" },
+  { sym: "شفن", name: "پتروشیمی فنآوران", type: "general" },
 
-  // // ── دارویی (Pharmaceuticals) ────────────────────────
+  // // // ── خودرو (Automotive) ──────────────────────────────
+  { sym: "خودرو", name: "ایران خودرو", type: "general" },
+  { sym: "خساپا", name: "سایپا", type: "general" },
+  { sym: "خپارس", name: "پارس خودرو", type: "general" },
+  { sym: "پتایر", name: "ایران تایر", type: "general" },
+  { sym: "پاسا", name: "ایران یاسا تایر", type: "general" },
+
+  // // // ── دارویی (Pharmaceuticals) ────────────────────────
   { sym: "برکت", name: "گروه دارویی برکت", type: "general" },
   { sym: "دتولید", name: "داروسازی تولید دارو", type: "general" },
   { sym: "دسبحا", name: "گروه دارویی سبحان", type: "general" },
@@ -113,36 +98,35 @@ export const WATCHLIST: Array<{
   { sym: "دیران", name: "ایران دارو", type: "general" },
   { sym: "دالبر", name: "البرز دارو", type: "general" },
 
-  // // ── غذایی (Food) ────────────────────────────────────
+  // // // ── غذایی (Food) ────────────────────────────────────
   { sym: "غپونه", name: "نوش پونه مشهد", type: "general" },
   { sym: "غشهد", name: "شهد ایران", type: "general" },
   { sym: "غچین", name: "کشت و صنعت چین چین", type: "general" },
   { sym: "غگرجی", name: "بیسکویت گرجی", type: "general" },
   { sym: "غبهنوش", name: "بهنوش ایران", type: "general" },
 
-  // // ── سیمان (Cement) ──────────────────────────────────
+  // // // ── سیمان (Cement) ──────────────────────────────────
   { sym: "ستران", name: "سیمان تهران", type: "general" },
   { sym: "سفارس", name: "سیمان فارس و خوزستان", type: "general" },
   { sym: "سبزوا", name: "سیمان لار سبزوار", type: "general" },
 
-  // // ── صنعتی و سایر (Industrial & Others) ──────────────
+  // // // ── صنعتی و سایر (Industrial & Others) ──────────────
   { sym: "کپشیر", name: "پشم شیشه ایران", type: "general" },
-  { sym: "تپمپی", name: "پمپ‌سازی ایران", type: "general" },
+  { sym: "تپمپی", name: "پمپسازی ایران", type: "general" },
   { sym: "پلاسک", name: "پلاسکوکار", type: "general" },
   { sym: "کسرام", name: "پارس سرام", type: "general" },
   { sym: "کچینی", name: "کارخانه چینی ایران", type: "general" },
   { sym: "لپارس", name: "پارس الکتریک", type: "general" },
   { sym: "حکشتی", name: "کشتیرانی", type: "general" },
-  { sym: "تمحرکه", name: "ماشین‌سازی نیرومحرکه", type: "general" },
+  { sym: "تمحرکه", name: "ماشینسازی نیرومحرکه", type: "general" },
 
-  // // ── بانک‌ها (Banks) ─────────────────────────────────
+  // // ── بانکها (Banks) ─────────────────────────────────
   { sym: "وبملت", name: "بانک ملت", type: "bank" },
   { sym: "وبصادر", name: "بانک صادرات", type: "bank" },
   { sym: "وپاسار", name: "بانک پاسارگاد", type: "bank" },
   { sym: "وتجارت", name: "بانک تجارت", type: "bank" },
   { sym: "وبفارس", name: "بانک پارسیان", type: "bank" },
   { sym: "وکار", name: "بانک کارآفرین", type: "bank" },
-  { sym: "وپارس", name: "بانک پارسیان", type: "bank" },
   { sym: "ونوین", name: "بانک اقتصاد نوین", type: "bank" },
   { sym: "وخاور", name: "بانک خاورمیانه", type: "bank" },
   { sym: "وسینا", name: "بانک سینا", type: "bank" },
@@ -157,16 +141,15 @@ export const WATCHLIST: Array<{
   { sym: "البرز", name: "بیمه البرز", type: "insurance" },
   { sym: "دانا", name: "بیمه دانا", type: "insurance" },
 
-  // // ── هلدینگ‌ها (Holdings) ────────────────────────────
+  // // ── هلدینگها (Holdings) ────────────────────────────
   { sym: "پارسان", name: "گسترش نفت و گاز پارسیان", type: "holding" },
-  { sym: "شستا", name: "سرمایه‌گذاری تأمین اجتماعی", type: "holding" },
-  { sym: "خگستر", name: "گسترش سرمایه‌گذاری ایران‌خودرو", type: "holding" },
-  { sym: "وغدیر", name: "سرمایه‌گذاری غدیر", type: "holding" },
-  { sym: "وامید", name: "سرمایه‌گذاری امید", type: "holding" },
-  { sym: "وصندوق", name: "سرمایه‌گذاری صندوق بازنشستگی", type: "holding" },
+  { sym: "شستا", name: "سرمایهگذاری تأمین اجتماعی", type: "holding" },
+  { sym: "خگستر", name: "گسترش سرمایهگذاری ایرانخودرو", type: "holding" },
+  { sym: "وغدیر", name: "سرمایهگذاری غدیر", type: "holding" },
+  { sym: "وامید", name: "سرمایهگذاری امید", type: "holding" },
+  { sym: "وصندوق", name: "سرمایهگذاری صندوق بازنشستگی", type: "holding" },
 ];
 
-/** Fast lookup: symbol → watchlist entry. */
 const WATCHLIST_BY_SYM = new Map(WATCHLIST.map((w) => [w.sym, w]));
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -178,7 +161,6 @@ const RETRY_ATTEMPTS = 3;
 const CODAL_CONCURRENCY = 3;
 const MONTHLY_SALES_DEPTH = 36;
 
-/** Retry with exponential backoff. */
 async function withRetry<T>(
   fn: () => Promise<T>,
   attempts = RETRY_ATTEMPTS,
@@ -196,10 +178,6 @@ async function withRetry<T>(
   throw lastErr;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Concurrency helper (must be defined BEFORE sync functions)
-// ═══════════════════════════════════════════════════════════════
-
 async function mapWithConcurrency<T, R>(
   items: T[],
   limit: number,
@@ -207,7 +185,6 @@ async function mapWithConcurrency<T, R>(
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let cursor = 0;
-
   async function worker() {
     while (true) {
       const i = cursor++;
@@ -217,13 +194,100 @@ async function mapWithConcurrency<T, R>(
       results[i] = await fn(item, i);
     }
   }
-
-  const workers = Array.from({ length: Math.min(limit, items.length) }, () =>
-    worker(),
-  );
-  await Promise.all(workers);
+  // Promise.all rejects on the FIRST failure while the other workers keep
+  // running. Their eventual rejections would then surface as unhandled
+  // rejections, which the process-level handler treats as fatal and takes the
+  // whole API down. Settle every worker so one bad item can't kill siblings.
+  await Promise.allSettled(
+    Array.from({ length: Math.min(limit, items.length) }, () => worker()),
+  ).then((outcomes) => {
+    const failure = outcomes.find(
+      (o): o is PromiseRejectedResult => o.status === "rejected",
+    );
+    if (failure) throw failure.reason;
+  });
   return results;
 }
+
+// ═══════════════════════════════════════════════════════════════
+// FX context — shared by every writer that stamps USD columns
+// ═══════════════════════════════════════════════════════════════
+
+interface FxContext {
+  rateRial: number | null;
+  quality: FxQualityStatus | null;
+  sources: string[] | null;
+  toUsd: (rialMillions: number | null) => number | null;
+}
+
+async function resolveFxContext(sql: PostgresDb): Promise<FxContext> {
+  const fxRate = await getFxRateForDate(sql, null).catch(() => null);
+  const rateRial = fxRate?.rateRial ?? null;
+  return {
+    rateRial,
+    quality: fxRate?.quality ?? null,
+    sources: fxRate ? Array.from(fxRate.sources) : null,
+    toUsd: (rialMillions) =>
+      rialMillions != null && rateRial && rateRial > 0
+        ? (rialMillions * 1_000_000) / rateRial
+        : null,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Single monthly-sales writer — used by BOTH syncMonthlySales
+// and ingestArchiveForSymbol (this is the de-duplicated core).
+// ═══════════════════════════════════════════════════════════════
+
+interface MonthlySalesUpsert {
+  symbol: string;
+  monthEnd: string; // ISO Gregorian
+  salesAmount: number;
+  reportUrl: string;
+  detail: unknown;
+  ytdTotal: number | null;
+  ytdPriorYear: number | null;
+  domesticRial: number | null;
+  exportRial: number | null;
+  serviceRial: number | null;
+}
+
+async function upsertMonthlySalesRow(
+  sql: PostgresDb,
+  fx: FxContext,
+  r: MonthlySalesUpsert,
+): Promise<void> {
+  await sql`
+    INSERT INTO monthly_sales (symbol, month_end, sales_amount, is_estimated, source_url, fetched_at, detail,
+                               sales_usd, domestic_usd, export_usd, service_usd,
+                               ytd_total_usd, ytd_prior_year_usd,
+                               fx_rate_rial, fx_quality, fx_sources)
+    VALUES (
+      ${r.symbol}, ${r.monthEnd}, ${r.salesAmount}, false, ${r.reportUrl}, NOW(),
+      ${JSON.stringify(r.detail ?? null)}::jsonb,
+      ${fx.toUsd(r.salesAmount)}, ${fx.toUsd(r.domesticRial)},
+      ${fx.toUsd(r.exportRial)}, ${fx.toUsd(r.serviceRial)},
+      ${fx.toUsd(r.ytdTotal)}, ${fx.toUsd(r.ytdPriorYear)},
+      ${fx.rateRial}, ${fx.quality}, ${fx.sources}
+    )
+    ON CONFLICT (symbol, month_end) DO UPDATE SET
+      sales_amount = EXCLUDED.sales_amount,
+      source_url  = EXCLUDED.source_url,
+      fetched_at  = NOW(),
+      detail      = EXCLUDED.detail,
+      sales_usd     = EXCLUDED.sales_usd,
+      domestic_usd  = EXCLUDED.domestic_usd,
+      export_usd    = EXCLUDED.export_usd,
+      service_usd   = EXCLUDED.service_usd,
+      ytd_total_usd       = EXCLUDED.ytd_total_usd,
+      ytd_prior_year_usd  = EXCLUDED.ytd_prior_year_usd,
+      fx_rate_rial  = EXCLUDED.fx_rate_rial,
+      fx_quality    = EXCLUDED.fx_quality,
+      fx_sources    = EXCLUDED.fx_sources
+  `;
+}
+
+const num = (v: unknown): number | null => (v != null ? Number(v) : null);
 
 // ═══════════════════════════════════════════════════════════════
 // Phase 1: TSETMC symbols + prices
@@ -257,15 +321,12 @@ export async function upsertStocks(
   let count = 0;
   for (const s of stocks) {
     const wl = WATCHLIST_BY_SYM.get(s.symbol);
-    const isBank = wl?.type === "bank";
-    const isInsurance = wl?.type === "insurance";
-    const isHolding = wl?.type === "holding";
-
     await sql`
       INSERT INTO stocks (symbol, name, sector, isin, shares_outstanding,
                           is_bank, is_insurance, is_holding_company, updated_at)
       VALUES (${s.symbol}, ${s.name}, ${s.sector}, ${s.isin}, ${s.shares},
-              ${isBank}, ${isInsurance}, ${isHolding}, NOW())
+              ${wl?.type === "bank"}, ${wl?.type === "insurance"},
+              ${wl?.type === "holding"}, NOW())
       ON CONFLICT (symbol) DO UPDATE SET
         name = EXCLUDED.name,
         sector = EXCLUDED.sector,
@@ -287,119 +348,119 @@ export async function insertPrices(
 ): Promise<number> {
   let count = 0;
   for (const s of stocks) {
-    await sql`
-      INSERT INTO prices (symbol, timestamp, last_price, volume, value, change_percent)
-      VALUES (${s.symbol}, NOW(), ${s.lastPrice}, ${s.volume}, ${s.value}, ${s.changePct})
-    `;
-    count++;
+    try {
+      await sql`
+        INSERT INTO prices (symbol, timestamp, last_price, volume, value, change_percent)
+        VALUES (${s.symbol}, NOW(), ${s.lastPrice}, ${s.volume}, ${s.value}, ${s.changePct})
+        ON CONFLICT (symbol, timestamp) DO UPDATE SET
+          last_price = EXCLUDED.last_price,
+          volume = EXCLUDED.volume,
+          value = EXCLUDED.value,
+          change_percent = EXCLUDED.change_percent
+      `;
+      count++;
+    } catch {
+      // A duplicate bare-NOW() timestamp (two runs in the same millisecond)
+      // is harmless — the next tick overwrites it.
+    }
   }
   return count;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Phase 2: Codal monthly sales
-// ═══════════════════════════════════════════════════════════════
-
-interface MonthlySalesDetail {
-  domesticMonthly?: number | string | null;
-  exportMonthly?: number | string | null;
-  serviceMonthly?: number | string | null;
-  ytdSalesTotal?: number | string | null;
-  priorYtdSalesTotal?: number | string | null;
+/**
+ * Retention prune for the append-only `prices` table.
+ *
+ * Prices are 5-minute ticks (~288/day/symbol). Nothing downstream needs more
+ * than ~30 days: market-cap history is a daily rollup, P/E uses latest only.
+ * Without this the table grows ~800K rows/year and every
+ * `ORDER BY timestamp DESC LIMIT 1` lateral slows down.
+ *
+ * Runs as a daily cron job; safe to call on demand (idempotent).
+ */
+export async function pruneOldPrices(
+  sql: PostgresDb,
+  olderThanDays = 30,
+): Promise<number> {
+  const rows = await sql<{ n: number }[]>`
+    WITH deleted AS (
+      DELETE FROM prices
+      WHERE timestamp < NOW() - (${olderThanDays} || ' days')::interval
+      RETURNING 1
+    )
+    SELECT COUNT(*)::int AS n FROM deleted
+  `;
+  return rows[0]?.n ?? 0;
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 2: Codal monthly sales (live scrape path)
+// ═══════════════════════════════════════════════════════════════
 
 export async function syncMonthlySales(
   sql: PostgresDb,
   symbols: string[],
 ): Promise<number> {
   let count = 0;
+  let skippedForThrottle = 0;
 
-  // Skip bank/insurance/holding (no monthly sales reports)
   const eligible = symbols.filter((sym) => {
     const wl = WATCHLIST_BY_SYM.get(sym);
-    if (!wl) return true;
-    return wl.type === "general";
+    return !wl || wl.type === "general";
   });
-
-  const skipped = symbols.length - eligible.length;
-  if (skipped > 0) {
+  if (eligible.length !== symbols.length) {
     console.log(
-      `  ↷ skipped ${skipped} financial instruments (bank/insurance/holding)`,
+      `  ↷ skipped ${symbols.length - eligible.length} financial instruments (bank/insurance/holding)`,
     );
   }
 
   await mapWithConcurrency(eligible, CODAL_CONCURRENCY, async (symbol) => {
+    // The breaker is per-IP and Codal's ban covers the whole host. Continuing
+    // through the remaining watchlist while banned only extends the ban, so
+    // stop early and let the cooldown run.
+    if (isCodalCoolingDown()) {
+      skippedForThrottle++;
+      return;
+    }
     try {
+      // Race the fetch against a deadline, but CLEAR the timer on success and
+      // keep a no-op catch on the losing promise. A `setTimeout` that fires
+      // after the fetch already won leaves a rejected promise nobody awaits,
+      // which surfaces as an unhandled rejection.
+      let timer: NodeJS.Timeout | undefined;
+      const deadline = new Promise<never>((_, rej) => {
+        timer = setTimeout(
+          () => rej(new Error("timeout")),
+          (FETCH_TIMEOUT_MS * MONTHLY_SALES_DEPTH) / 3,
+        );
+      });
+      const fetching = fetchMonthlySales(symbol, MONTHLY_SALES_DEPTH);
+      fetching.catch(() => {}); // orphan guard: never let this reject unhandled
+
       const sales: MonthlyReportResult[] = await withRetry(() =>
-        Promise.race([
-          fetchMonthlySales(symbol, MONTHLY_SALES_DEPTH),
-          new Promise<never>((_, rej) =>
-            setTimeout(
-              () => rej(new Error("timeout")),
-              (FETCH_TIMEOUT_MS * MONTHLY_SALES_DEPTH) / 3,
-            ),
-          ),
-        ]),
-      );
+        Promise.race([fetching, deadline]),
+      ).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
 
-      // Shared FX rate for this symbol's batch (rates are daily)
-      const fxRate = await getFxRateForDate(sql, null).catch(() => null);
-      const rateRial = fxRate?.rateRial ?? null;
-
-      const toUsd = (rialMillions: number | null) =>
-        rialMillions != null && rateRial && rateRial > 0
-          ? (rialMillions * 1_000_000) / rateRial
-          : null;
+      const fx = await resolveFxContext(sql);
 
       for (const s of sales) {
         const monthEnd = toIsoDate(
           jalaliToGregorian(s.periodEnd.jy, s.periodEnd.jm, s.periodEnd.jd),
         );
-
         const d: any = s.detail ?? {};
-        const domRial =
-          d.domesticMonthly != null ? Number(d.domesticMonthly) : null;
-        const expRial =
-          d.exportMonthly != null ? Number(d.exportMonthly) : null;
-        const svcRial =
-          d.serviceMonthly != null ? Number(d.serviceMonthly) : null;
-        // YTD values from full report (detail has ytdSalesTotal, priorYtdSalesTotal)
-        const ytdRial =
-          s.full?.ytdTotal != null ? Number(s.full.ytdTotal) : null;
-        const ytdPriorRial =
-          s.full?.ytdPriorYearTotal != null
-            ? Number(s.full.ytdPriorYearTotal)
-            : null;
-
-        await sql`
-          INSERT INTO monthly_sales (symbol, month_end, sales_amount, is_estimated, source_url, fetched_at, detail,
-                                     sales_usd, domestic_usd, export_usd, service_usd,
-                                     ytd_total_usd, ytd_prior_year_usd,
-                                     fx_rate_rial, fx_quality, fx_sources)
-          VALUES (
-            ${symbol}, ${monthEnd}, ${s.amount}, false, ${s.reportUrl}, NOW(),
-            ${JSON.stringify(s.detail ?? null)}::jsonb,
-            ${toUsd(s.amount)}, ${toUsd(domRial)}, ${toUsd(expRial)}, ${toUsd(svcRial)},
-            ${toUsd(ytdRial)}, ${toUsd(ytdPriorRial)},
-            ${rateRial},
-            ${fxRate ? fxRate.quality : null},
-            ${fxRate ? Array.from(fxRate.sources) : null}
-          )
-          ON CONFLICT (symbol, month_end) DO UPDATE SET
-            sales_amount = EXCLUDED.sales_amount,
-            source_url  = EXCLUDED.source_url,
-            fetched_at  = NOW(),
-            detail      = EXCLUDED.detail,
-            sales_usd     = EXCLUDED.sales_usd,
-            domestic_usd  = EXCLUDED.domestic_usd,
-            export_usd    = EXCLUDED.export_usd,
-            service_usd   = EXCLUDED.service_usd,
-            ytd_total_usd       = EXCLUDED.ytd_total_usd,
-            ytd_prior_year_usd  = EXCLUDED.ytd_prior_year_usd,
-            fx_rate_rial  = EXCLUDED.fx_rate_rial,
-            fx_quality    = EXCLUDED.fx_quality,
-            fx_sources    = EXCLUDED.fx_sources
-        `;
+        await upsertMonthlySalesRow(sql, fx, {
+          symbol,
+          monthEnd,
+          salesAmount: s.amount,
+          reportUrl: s.reportUrl,
+          detail: s.detail ?? null,
+          ytdTotal: num(s.full?.ytdTotal),
+          ytdPriorYear: num(s.full?.ytdPriorYearTotal),
+          domesticRial: num(d.domesticMonthly),
+          exportRial: num(d.exportMonthly),
+          serviceRial: num(d.serviceMonthly),
+        });
         count++;
       }
       console.log(`  [${symbol}] ✓ ${sales.length} monthly sales records`);
@@ -410,40 +471,25 @@ export async function syncMonthlySales(
     await sleep(DELAY_MS);
   });
 
+  if (skippedForThrottle) {
+    console.warn(
+      `  ⚠ ${skippedForThrottle} symbols skipped — ${codalThrottleStatus()}`,
+    );
+  }
   return count;
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Phase 3: Codal quarterly financials (Playwright)
+// Phase 3: Codal quarterly financials
 // ═══════════════════════════════════════════════════════════════
 
-/**
- * Convert Codal's CUMULATIVE year-to-date income-statement columns into
- * discrete single-quarter figures.
- *
- * Codal publishes one income statement per letter, whose columns are cumulative:
- *   3 ماهه → Q1 YTD
- *   6 ماهه → H1 YTD  (= Q1 + Q2)
- *   9 ماهه → 9M YTD  (= Q1 + Q2 + Q3)
- *   12 ماهه → FY YTD (= Q1..Q4)
- *
- * A single letter therefore yields multiple overlapping cumulative snapshots.
- * Storing those directly would double-count (a 6M column would be written as
- * "Q1" purely because its period-end lands in month 3) and make the TTM margin
- * wildly wrong.
- *
- * This function groups every (periodEnd, duration, revenue, profit) tuple by
- * fiscal year, sorts by duration, and differences consecutive cumulative values
- * to recover true single-quarter revenue/profit. A missing shorter cumulative
- * column means that quarter cannot be isolated and is dropped.
- */
 export interface DiscreteQuarter {
   fiscalYear: number;
   quarter: number;
-  periodEnd: string; // ISO Gregorian
+  periodEnd: string;
   revenue: number | null;
   netProfit: number | null;
-  margin: number | null; // single-quarter net margin
+  margin: number | null;
 }
 
 export function toDiscreteQuarters(f: {
@@ -461,18 +507,15 @@ export function toDiscreteQuarters(f: {
     netProfit: number | null;
   }
 
-  // ── 1. Normalise every column into a cumulative record ──
   const cums: Cum[] = [];
   for (let i = 0; i < f.periodEnds.length; i++) {
     const pe = f.periodEnds[i];
     if (!pe) continue;
-
     const jy = parseInt(pe.slice(0, 4), 10);
     const jm = parseInt(pe.slice(5, 7), 10);
     const jd = parseInt(pe.slice(8, 10), 10);
     if (!jy || !jm || !jd) continue;
 
-    // Duration: prefer the parsed "N ماهه" label, else derive from period-end month.
     const labelled = f.durationMonths?.[i] ?? 0;
     const duration =
       labelled > 0 ? labelled : Math.min(4, Math.ceil(jm / 3)) * 3;
@@ -487,7 +530,6 @@ export function toDiscreteQuarters(f: {
     });
   }
 
-  // ── 2. Group by fiscal year, keep the longest cumulative per quarter ──
   const byYear = new Map<number, Cum[]>();
   for (const c of cums) {
     const arr = byYear.get(c.fiscalYear) ?? [];
@@ -495,7 +537,6 @@ export function toDiscreteQuarters(f: {
     byYear.set(c.fiscalYear, arr);
   }
 
-  // ── 3. Difference consecutive cumulative values → single quarters ──
   const out: DiscreteQuarter[] = [];
   for (const [, arr] of byYear) {
     arr.sort((a, b) => a.duration - b.duration);
@@ -504,32 +545,23 @@ export function toDiscreteQuarters(f: {
       const cur = arr[i]!;
       const prev = i > 0 ? arr[i - 1]! : null;
 
-      // Q1: the 3-month cumulative IS the single quarter.
-      // Q2..Q4: single quarter = this cumulative − previous cumulative.
       let revenue: number | null;
       let netProfit: number | null;
 
       if (cur.duration <= 3) {
-        // Q1: the 3-month cumulative IS the single quarter.
         revenue = cur.revenue;
         netProfit = cur.netProfit;
       } else if (!prev) {
-        // No shorter cumulative in this fiscal year — cannot isolate this
-        // quarter without guessing (e.g. a lone 6M column could be Q1+Q2).
         continue;
       } else {
-        // Without a prior cumulative we cannot isolate this quarter.
-        if (prev.revenue === null || cur.revenue === null) {
-          revenue = null;
-          netProfit = null;
-        } else {
-          revenue = cur.revenue - prev.revenue;
-        }
-        if (prev.netProfit === null || cur.netProfit === null) {
-          netProfit = null;
-        } else {
-          netProfit = cur.netProfit - prev.netProfit;
-        }
+        revenue =
+          prev.revenue === null || cur.revenue === null
+            ? null
+            : cur.revenue - prev.revenue;
+        netProfit =
+          prev.netProfit === null || cur.netProfit === null
+            ? null
+            : cur.netProfit - prev.netProfit;
       }
 
       const margin =
@@ -558,13 +590,12 @@ export async function syncQuarterlyFinancials(
   let count = 0;
 
   await mapWithConcurrency(symbols, 2, async (symbol) => {
+    if (isCodalCoolingDown()) return;
     try {
       const q = await withRetry(() => fetchQuarterlyFinancials(symbol));
       if (!q) return;
 
       const f = q.financials;
-
-      // Convert Codal's cumulative YTD columns into discrete single quarters.
       const quarters = toDiscreteQuarters({
         periodEnds: f.periodEnds ?? [],
         durationMonths: f.durationMonths ?? [],
@@ -578,7 +609,6 @@ export async function syncQuarterlyFinancials(
       }
 
       for (const qtr of quarters) {
-        // Skip quarters with no usable margin (P/E would be meaningless)
         if (qtr.margin === null) {
           console.log(
             `  [${symbol}] ✗ Q${qtr.quarter} ${qtr.fiscalYear} margin=null, skipping`,
@@ -922,10 +952,9 @@ export async function refreshRankings(sql: PostgresDb): Promise<void> {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Phase 0: FX rates (Wallex + Nobitex)
+// Phase 0: FX rates
 // ═══════════════════════════════════════════════════════════════
 
-/** Fetch the latest USD/IRR rate and persist to fx_rates table (idempotent). */
 export async function syncFxRates(sql: PostgresDb): Promise<number> {
   let rate: FxRate;
   try {
@@ -938,13 +967,9 @@ export async function syncFxRates(sql: PostgresDb): Promise<number> {
   await sql`
     INSERT INTO fx_rates (rate_date, rate_toman, rate_rial, sources, quality, readings, fetched_at)
     VALUES (
-      CURRENT_DATE,
-      ${rate.rateToman},
-      ${rate.rateRial},
-      ${Array.from(rate.sources)}::text[],
-      ${rate.quality},
-      ${JSON.stringify(rate.readings)}::jsonb,
-      NOW()
+      CURRENT_DATE, ${rate.rateToman}, ${rate.rateRial},
+      ${Array.from(rate.sources)}::text[], ${rate.quality},
+      ${JSON.stringify(rate.readings)}::jsonb, NOW()
     )
     ON CONFLICT (rate_date) DO UPDATE SET
       rate_toman = EXCLUDED.rate_toman,
@@ -961,7 +986,6 @@ export async function syncFxRates(sql: PostgresDb): Promise<number> {
   return 1;
 }
 
-/** Get the nearest FX rate (Rial per USD) for a date. Forward-fallback for future dates. null → today. */
 export async function getFxRateForDate(
   sql: PostgresDb,
   dateStr: string | null,
@@ -985,21 +1009,9 @@ export async function getFxRateForDate(
     LIMIT 1
   `;
 
-  let r;
-  if (rows.length > 0) {
-    r = rows[0];
-  } else {
-    // Forward fallback: nearest future date
-    const f: any = await sql<
-      Array<{
-        rate_toman: number;
-        rate_rial: number;
-        sources: string[];
-        quality: string;
-        readings: Record<string, unknown>;
-        fetched_at: Date;
-      }>
-    >`
+  let r: any = rows[0];
+  if (!r) {
+    const f = await sql<any[]>`
       SELECT rate_toman, rate_rial, sources, quality, readings, fetched_at
       FROM fx_rates
       WHERE rate_date >= ${targetDate}::date
@@ -1021,12 +1033,18 @@ export async function getFxRateForDate(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Phase 1b: Market-cap history (TSETMC prices × shares × FX)
+// Phase 1b: Market-cap history
 // ═══════════════════════════════════════════════════════════════
 
-/** Build daily market-cap history from TSETMC price snapshots × shares outstanding. */
 export async function syncMarketCapHistory(sql: PostgresDb): Promise<number> {
-  const snapshots: any = await sql`
+  const snapshots = await sql<
+    Array<{
+      symbol: string;
+      date: Date;
+      last_price: number;
+      shares_outstanding: number | null;
+    }>
+  >`
     WITH daily_last AS (
       SELECT DISTINCT ON (symbol, DATE(timestamp))
         symbol, DATE(timestamp) AS date, last_price
@@ -1042,17 +1060,12 @@ export async function syncMarketCapHistory(sql: PostgresDb): Promise<number> {
   `;
 
   let count = 0;
-  for (const row of snapshots as Array<{
-    symbol: string;
-    date: Date;
-    last_price: number;
-    shares_outstanding: number | null;
-  }>) {
+  for (const row of snapshots) {
     const price = Number(row.last_price);
     const shares = Number(row.shares_outstanding!);
     const mcapRial = price * shares;
-
     const dateStr = row.date.toISOString().slice(0, 10);
+
     const fxRate = await getFxRateForDate(sql, dateStr).catch(() => null);
     const rateRial = fxRate?.rateRial ?? null;
     const mcapUsd = rateRial && rateRial > 0 ? mcapRial / rateRial : null;
@@ -1062,7 +1075,7 @@ export async function syncMarketCapHistory(sql: PostgresDb): Promise<number> {
                                       fx_rate_rial, fx_quality, fx_sources, source)
       VALUES (
         ${row.symbol}, ${dateStr}::date, ${price}, ${shares}, ${mcapRial}, ${mcapUsd},
-        ${rateRial}, ${fxRate ? fxRate.quality : null},
+        ${rateRial}, ${fxRate?.quality ?? null},
         ${fxRate ? Array.from(fxRate.sources) : null},
         'tsetmc_fx'
       )
@@ -1082,18 +1095,13 @@ export async function syncMarketCapHistory(sql: PostgresDb): Promise<number> {
   return count;
 }
 
-/** Fetch current price snapshots for live TSETMC symbols (used by cron). */
 export async function fetchCurrentPrices(
   sql: PostgresDb,
 ): Promise<ResolvedInstrument[]> {
-  const symbols = WATCHLIST.map((w) => w.sym);
   const out: ResolvedInstrument[] = [];
-  for (const sym of symbols) {
+  for (const { sym, name } of WATCHLIST) {
     try {
-      const snap = await tsetmc.resolveSymbol(
-        sym,
-        WATCHLIST_BY_SYM.get(sym)?.name ?? null,
-      );
+      const snap = await tsetmc.resolveSymbol(sym, name ?? null);
       if (snap) out.push(snap);
     } catch (e: unknown) {
       console.error(
@@ -1106,51 +1114,68 @@ export async function fetchCurrentPrices(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Archive/backfill helpers
+// Archive/backfill
 // ═══════════════════════════════════════════════════════════════
 
-export async function ingestArchiveForSymbol(
-  sql: PostgresDb,
-  symbol: string,
-  fromJalali: string,
-  toJalali: string,
-): Promise<{
+export interface ArchiveResult {
+  symbol: string;
   lettersFound: number;
   reportsParsed: number;
   rowsUpserted: number;
   errors: string[];
-}> {
-  const errors: string[] = [];
+}
 
-  // Fetch ALL letters from Codal with pagination (API returns 20 per page).
-  // NOTE: Codal's FromDate/ToDate params accept Jalali dates but don't actually
-  // filter — they silently ignore them and return all results. So we paginate
-  // without date filters, then let the DB upsert (ON CONFLICT) handle dedup.
-  const opts: Record<string, unknown> = {};
+export async function ingestArchiveForSymbol(
+  sql: PostgresDb,
+  symbol: string,
+  _fromJalali: string,
+  _toJalali: string,
+): Promise<Omit<ArchiveResult, "symbol">> {
+  const errors: string[] = [];
+  const wl = WATCHLIST_BY_SYM.get(symbol);
+  await sql`
+    INSERT INTO stocks (
+      symbol, name, sector,
+      is_bank, is_insurance, is_holding_company,
+      updated_at
+    )
+    VALUES (
+      ${symbol},
+      ${wl?.name ?? symbol},
+      ${null},
+      ${wl?.type === "bank"},
+      ${wl?.type === "insurance"},
+      ${wl?.type === "holding"},
+      NOW()
+    )
+    ON CONFLICT (symbol) DO NOTHING
+  `;
+
   const allLetters: CodalLetter[] = [];
   for (let page = 1; page <= 20; page++) {
-    const pageOpts = { ...opts, PageNumber: String(page) };
-    const letters = await searchLetters(symbol, pageOpts);
+    if (isCodalCoolingDown()) {
+      console.warn(`  [${symbol}] ⚠ stopping at page ${page} — ${codalThrottleStatus()}`);
+      break;
+    }
+    const letters = await searchLetters(symbol, { PageNumber: String(page) });
     if (letters.length === 0) break;
     allLetters.push(...letters);
-    if (letters.length < 20) break; // last page
+    if (letters.length < 20) break;
   }
   const monthly = filterMonthlySalesLetters(allLetters);
+
   let reportsParsed = 0;
   let rowsUpserted = 0;
+  const fx = await resolveFxContext(sql);
 
-  const fxRate = await getFxRateForDate(sql, null).catch(() => null);
-  const rateRial = fxRate?.rateRial ?? null;
-
-  const toUsd = (rialMillions: number | null) =>
-    rialMillions != null && rateRial && rateRial > 0
-      ? (rialMillions * 1_000_000) / rateRial
-      : null;
-
-  // Process monthly reports with rate-limit-aware retry
   for (const letter of monthly) {
+    if (isCodalCoolingDown()) {
+      console.warn(
+        `  [${symbol}] ⚠ stopping report fetch — ${codalThrottleStatus()}`,
+      );
+      break;
+    }
     try {
-      // fetchReportHtml is rate-limited and 429-retried inside the scraper.
       const html = await fetchReportHtml(letter.url);
       const full = extractMonthlySalesFull(
         html,
@@ -1168,45 +1193,20 @@ export async function ingestArchiveForSymbol(
           full.periodEnd.jd,
         ),
       );
-
       const d: any = full.detail ?? {};
-      const domRial =
-        d.domesticMonthly != null ? Number(d.domesticMonthly) : null;
-      const expRial = d.exportMonthly != null ? Number(d.exportMonthly) : null;
-      const svcRial =
-        d.serviceMonthly != null ? Number(d.serviceMonthly) : null;
-      const ytdRial = full.ytdTotal != null ? Number(full.ytdTotal) : null;
-      const ytdPriorRial =
-        full.ytdPriorYearTotal != null ? Number(full.ytdPriorYearTotal) : null;
 
-      await sql`
-        INSERT INTO monthly_sales (symbol, month_end, sales_amount, is_estimated, source_url, fetched_at, detail,
-                                   sales_usd, domestic_usd, export_usd, service_usd,
-                                   ytd_total_usd, ytd_prior_year_usd,
-                                   fx_rate_rial, fx_quality, fx_sources)
-        VALUES (
-          ${symbol}, ${monthEnd}, ${full.total}, false, ${full.url}, NOW(),
-          ${JSON.stringify(full.detail ?? null)}::jsonb,
-          ${toUsd(full.total)}, ${toUsd(domRial)}, ${toUsd(expRial)}, ${toUsd(svcRial)},
-          ${toUsd(ytdRial)}, ${toUsd(ytdPriorRial)},
-          ${rateRial}, ${fxRate ? fxRate.quality : null},
-          ${fxRate ? Array.from(fxRate.sources) : null}
-        )
-        ON CONFLICT (symbol, month_end) DO UPDATE SET
-          sales_amount = EXCLUDED.sales_amount,
-          source_url  = EXCLUDED.source_url,
-          fetched_at  = NOW(),
-          detail      = EXCLUDED.detail,
-          sales_usd     = EXCLUDED.sales_usd,
-          domestic_usd  = EXCLUDED.domestic_usd,
-          export_usd    = EXCLUDED.export_usd,
-          service_usd   = EXCLUDED.service_usd,
-          ytd_total_usd       = EXCLUDED.ytd_total_usd,
-          ytd_prior_year_usd  = EXCLUDED.ytd_prior_year_usd,
-          fx_rate_rial  = EXCLUDED.fx_rate_rial,
-          fx_quality    = EXCLUDED.fx_quality,
-          fx_sources    = EXCLUDED.fx_sources
-      `;
+      await upsertMonthlySalesRow(sql, fx, {
+        symbol,
+        monthEnd,
+        salesAmount: full.total,
+        reportUrl: full.url,
+        detail: full.detail ?? null,
+        ytdTotal: num(full.ytdTotal),
+        ytdPriorYear: num(full.ytdPriorYearTotal),
+        domesticRial: num(d.domesticMonthly),
+        exportRial: num(d.exportMonthly),
+        serviceRial: num(d.serviceMonthly),
+      });
       rowsUpserted++;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1214,7 +1214,12 @@ export async function ingestArchiveForSymbol(
     }
   }
 
-  return { lettersFound: monthly.length, reportsParsed, rowsUpserted, errors };
+  return {
+    lettersFound: monthly.length,
+    reportsParsed,
+    rowsUpserted,
+    errors,
+  };
 }
 
 export async function ingestArchiveForSymbols(
@@ -1222,29 +1227,13 @@ export async function ingestArchiveForSymbols(
   symbols: string[],
   fromJalali: string,
   toJalali: string,
-): Promise<
-  Array<{
-    symbol: string;
-    lettersFound: number;
-    reportsParsed: number;
-    rowsUpserted: number;
-    errors: string[];
-  }>
-> {
-  const results: Array<{
-    symbol: string;
-    lettersFound: number;
-    reportsParsed: number;
-    rowsUpserted: number;
-    errors: string[];
-  }> = [];
-
+): Promise<ArchiveResult[]> {
+  const results: ArchiveResult[] = [];
   for (const symbol of symbols) {
     const res = await ingestArchiveForSymbol(sql, symbol, fromJalali, toJalali);
     results.push({ symbol, ...res });
     await sleep(DELAY_MS);
   }
-
   return results;
 }
 
@@ -1273,17 +1262,13 @@ export async function runFullIngest(sql: PostgresDb): Promise<{
     console.log("\n=== Phase 1b: Market-cap history ===");
     const mcapCount = await syncMarketCapHistory(sql);
 
+    const syms = snapshots.map((s) => s.symbol);
+
     console.log("\n=== Phase 2: Codal monthly sales ===");
-    const salesCount = await syncMonthlySales(
-      sql,
-      snapshots.map((s) => s.symbol),
-    );
+    const salesCount = await syncMonthlySales(sql, syms);
 
     console.log("\n=== Phase 3: Codal quarterly financials ===");
-    const quarterlyCount = await syncQuarterlyFinancials(
-      sql,
-      snapshots.map((s) => s.symbol),
-    );
+    const quarterlyCount = await syncQuarterlyFinancials(sql, syms);
 
     console.log("\n=== Phase 4: Forward P/E ===");
     const peCount = await recomputeForwardPe(sql);
@@ -1301,7 +1286,6 @@ export async function runFullIngest(sql: PostgresDb): Promise<{
       pe: peCount,
     };
   } finally {
-    // Close Playwright browser so Node process can exit
     await closeBrowser();
   }
 }

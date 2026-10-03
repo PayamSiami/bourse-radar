@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { getOrSet } from "#utils/cache";
 
 export async function registerPriceHistoryRoutes(
   server: FastifyInstance,
@@ -54,24 +55,34 @@ export async function registerPriceHistoryRoutes(
       const { days = 90 } = req.query as { days?: number };
       const sym = decodeURIComponent(symbol);
 
-      const points = await server.db<{ t: Date; p: number }[]>`
-        SELECT timestamp AS t, last_price::float8 AS p
-        FROM prices
-        WHERE symbol = ${sym}
-          AND timestamp > NOW() - (${days} || ' days')::interval
-          AND last_price IS NOT NULL
-        ORDER BY timestamp ASC
-      `;
+      const { data, hit } = await getOrSet(
+        server,
+        `price-history:${sym}:days=${days}`,
+        60,
+        async () => {
+          const points = await server.db<{ t: Date; p: number }[]>`
+            SELECT timestamp AS t, last_price::float8 AS p
+            FROM prices
+            WHERE symbol = ${sym}
+              AND timestamp > NOW() - (${days} || ' days')::interval
+              AND last_price IS NOT NULL
+            ORDER BY timestamp ASC
+          `;
 
-      return reply.send({
-        symbol: sym,
-        points,
-        meta: {
-          count: points.length,
-          from: points[0]?.t?.toISOString() ?? null,
-          to: points[points.length - 1]?.t?.toISOString() ?? null,
+          return {
+            symbol: sym,
+            points,
+            meta: {
+              count: points.length,
+              from: points[0]?.t?.toISOString() ?? null,
+              to: points[points.length - 1]?.t?.toISOString() ?? null,
+            },
+          };
         },
-      });
+      );
+
+      reply.header("x-cache", hit ? "HIT" : "MISS");
+      return reply.send(data);
     },
   );
 
@@ -123,9 +134,14 @@ export async function registerPriceHistoryRoutes(
       const { symbol } = req.params as { symbol: string };
       const sym = decodeURIComponent(symbol);
 
-      // Get all monthly sales for this symbol, grouped by Jalali year
-      // We use sales_amount and derive Jalali year from month_end via a
-      const rows = await server.db<
+      const { data, hit } = await getOrSet(
+        server,
+        `monthly-chart:${sym}`,
+        300,
+        async () => {
+          // Get all monthly sales for this symbol, grouped by Jalali year
+          // We use sales_amount and derive Jalali year from month_end via a
+          const rows = await server.db<
         {
           month_end: Date;
           sales_amount: number;
@@ -174,7 +190,7 @@ export async function registerPriceHistoryRoutes(
 
         const arrR = byYearRial.get(jy);
         const arrU = byYearUsd.get(jy);
-        if (!arrR) continue;
+        if (!arrR || !arrU) continue;
         arrR[jm] = r.sales_amount;
         arrU[jm] = r.sales_usd;
 
@@ -192,25 +208,30 @@ export async function registerPriceHistoryRoutes(
         fxQuality: rows.find((r) => r.period_jy === jy)?.fx_quality ?? "fallback",
       }));
 
-      return reply.send({
-        symbol: sym,
-        years,
-        months: [
-          "فروردین",
-          "اردیبهشت",
-          "خرداد",
-          "تیر",
-          "مرداد",
-          "شهریور",
-          "مهر",
-          "آبان",
-          "آذر",
-          "دی",
-          "بهمن",
-          "اسفند",
-        ],
-        meta: { count: rows.length },
-      });
+          return {
+            symbol: sym,
+            years,
+            months: [
+              "فروردین",
+              "اردیبهشت",
+              "خرداد",
+              "تیر",
+              "مرداد",
+              "شهریور",
+              "مهر",
+              "آبان",
+              "آذر",
+              "دی",
+              "بهمن",
+              "اسفند",
+            ],
+            meta: { count: rows.length },
+          };
+        },
+      );
+
+      reply.header("x-cache", hit ? "HIT" : "MISS");
+      return reply.send(data);
     },
   );
 }

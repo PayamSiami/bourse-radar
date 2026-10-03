@@ -29,25 +29,21 @@ export async function registerSwagger(server: FastifyInstance) {
 
   await server.register(fastifySwaggerUI, {
     routePrefix: "/docs",
-    swagger: {
-      info: {
-        title: "Bourse Radar API",
-        description: "Quantitative Tehran Stock Exchange ranking engine.",
-        version: "0.1.0",
-      },
-    },
     staticCSP: false,
-    transformStaticCSP: (req) => ({ provider: req.isSecure() }),
-    transform: (oP) => {
-      const result = { ...oP };
-      if (!result.definition || !result.definition.components) {
-        result.definition = { ...result.definition, components: {} };
-      }
-      result.definition.components = {
+    uiConfig: {
+      docExpansion: "list",
+      deepLinking: true,
+    },
+    // Add the API-key security scheme to the generated spec.
+    transformSpecification: (swaggerObject) => {
+      const result = { ...swaggerObject } as Record<string, any>;
+      const components = (result.components ?? {}) as Record<string, any>;
+      result.components = {
+        ...components,
         securitySchemes: {
+          ...(components.securitySchemes ?? {}),
           apiKey: { type: "apiKey", name: "X-API-Key", in: "header" },
         },
-        ...result.definition.components,
       };
       return result;
     },

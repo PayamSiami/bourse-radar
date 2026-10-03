@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { getOrSet } from "#utils/cache";
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -59,7 +60,15 @@ export async function registerSectorsRoutes(
       },
     },
     async (req, reply) => {
-      const rows = await server.db<SectorRow[]>`
+      // Sectors change only when stocks/forward_pe refresh (daily cron),
+      // so a 5-minute shared entry is safe and collapses the homepage's
+      // two-request fan-out (rankings + sectors) into zero DB hits on repeat.
+      const { data, hit } = await getOrSet(
+        server,
+        "sectors:list",
+        300,
+        async () => {
+          const rows = await server.db<SectorRow[]>`
         WITH latest_fp AS (
           -- Latest forward_pe row per symbol
           SELECT DISTINCT ON (symbol)
@@ -116,16 +125,21 @@ export async function registerSectorsRoutes(
         FROM stocks
         WHERE sector IS NOT NULL AND sector <> ''
       `;
-      const totalStocks = totalRows[0]?.count ?? 0;
+          const totalStocks = totalRows[0]?.count ?? 0;
 
-      return reply.send({
-        data: rows,
-        meta: {
-          total: rows.length,
-          totalStocks,
-          generatedAt: new Date().toISOString(),
+          return {
+            data: rows,
+            meta: {
+              total: rows.length,
+              totalStocks,
+              generatedAt: new Date().toISOString(),
+            },
+          };
         },
-      });
+      );
+
+      reply.header("x-cache", hit ? "HIT" : "MISS");
+      return reply.send(data);
     },
   );
 }

@@ -17,39 +17,9 @@ const QuerySchema = z.object({
 
 type QueryInput = z.infer<typeof QuerySchema>;
 
-// ---------- Cache helpers ----------
-
+// ---------- Cache helpers (use shared helper v1: prefix) ----------
+import { getOrSet } from "#utils/cache";
 const CACHE_TTL_SECONDS = 900;
-const CACHE_TTL_MS = CACHE_TTL_SECONDS * 1000;
-
-interface CachedEnvelope<T> {
-  data: T;
-  _cachedAt: number;
-}
-
-async function readCache<T>(
-  redis: FastifyInstance["redis"],
-  key: string,
-): Promise<T | null> {
-  const raw = await redis.get(key);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw) as CachedEnvelope<T>;
-    if (Date.now() - parsed._cachedAt < CACHE_TTL_MS) return parsed.data;
-  } catch {
-    // Corrupt cache entry — ignore and let caller regenerate.
-  }
-  return null;
-}
-
-async function writeCache<T>(
-  redis: FastifyInstance["redis"],
-  key: string,
-  data: T,
-): Promise<void> {
-  const envelope: CachedEnvelope<T> = { data, _cachedAt: Date.now() };
-  await redis.setex(key, CACHE_TTL_SECONDS, JSON.stringify(envelope));
-}
 
 // ---------- Confidence mapping ----------
 
@@ -97,14 +67,8 @@ export async function registerRankingsRoutes(
       }
       const q = parsed.data;
 
-      const cacheKey = `rankings:${JSON.stringify(q)}`;
-
-      if (!q.refresh) {
-        const cached = await readCache<unknown>(server.redis, cacheKey);
-        if (cached) return cached;
-      }
-
-      // ---- Build SQL ----
+      // Build SQL + params BEFORE the cache probe — the compute closure
+      // references them, so they must exist (no TDZ) when the probe runs.
       const filters: string[] = [
         `fp.forward_pe IS NOT NULL`,
         `fp.forward_pe > 0`,
@@ -173,8 +137,35 @@ export async function registerRankingsRoutes(
         LIMIT ${limitPlaceholder} OFFSET 0
       `;
 
-      const rows = await server.db.unsafe(sql, [...params, q.limit] as never[]);
+      const cacheKey = `rankings:${JSON.stringify(q)}`;
 
+      if (!q.refresh) {
+        const { data, hit } = await getOrSet(
+          server,
+          cacheKey,
+          CACHE_TTL_SECONDS,
+          async () => {
+            const rowsInner = await server.db.unsafe(
+              sql,
+              [...params, q.limit] as never[],
+            );
+            return {
+              data: rowsInner,
+              meta: {
+                count: rowsInner.length,
+                filters: q,
+                generatedAt: new Date().toISOString(),
+                source: "materialized_view" as const,
+              },
+            };
+          },
+        );
+        reply.header("x-cache", hit ? "HIT" : "MISS");
+        return data;
+      }
+
+      // refresh=true → bypass cache and run the query directly.
+      const rows = await server.db.unsafe(sql, [...params, q.limit] as never[]);
       const result = {
         data: rows,
         meta: {
@@ -184,9 +175,9 @@ export async function registerRankingsRoutes(
           source: "materialized_view" as const,
         },
       };
-
-      await writeCache(server.redis, cacheKey, result);
-
+      // Warm the shared entry for the next reader (best-effort, fail-open).
+      getOrSet(server, cacheKey, CACHE_TTL_SECONDS, async () => result).catch(() => {});
+      reply.header("x-cache", "MISS");
       return result;
     },
   );
@@ -200,13 +191,14 @@ export async function registerRankingsRoutes(
         description: "Rankings broken down by sector",
       },
     },
-    async () => {
+    async (req, reply) => {
       const cacheKey = "rankings:sectors";
-
-      const cached = await readCache<unknown>(server.redis, cacheKey);
-      if (cached) return cached;
-
-      const rows = await server.db`
+      const { data, hit } = await getOrSet(
+        server,
+        cacheKey,
+        CACHE_TTL_SECONDS,
+        async () => {
+          const rowsInner = await server.db`
         SELECT
           s.sector,
           COUNT(*)                          AS "stock_count",
@@ -230,15 +222,20 @@ export async function registerRankingsRoutes(
         GROUP BY s.sector
         ORDER BY AVG(fr.attractiveness_score) DESC
       `;
-
-      const result = {
-        data: rows,
-        generatedAt: new Date().toISOString(),
-      };
-
-      await writeCache(server.redis, cacheKey, result);
-
-      return result;
+          return {
+            data: rowsInner,
+            generatedAt: new Date().toISOString(),
+          };
+        },
+      );
+      if (hit) {
+        reply.header("x-cache", "HIT");
+        return data;
+      }
+      // Fall through to compute — handled by getOrSet above? Actually we already computed via getOrSet.
+      // getOrSet returned MISS with fresh data, so return it.
+      reply.header("x-cache", "MISS");
+      return data;
     },
   );
 }

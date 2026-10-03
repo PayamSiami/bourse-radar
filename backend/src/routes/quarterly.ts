@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { getOrSet } from "#utils/cache";
 
 export async function registerQuarterlyRoutes(
   server: FastifyInstance,
@@ -39,8 +40,13 @@ export async function registerQuarterlyRoutes(
       const { symbol } = req.params as { symbol: string };
       const sym = decodeURIComponent(symbol);
 
-      // Get the last N quarterly_financials for this symbol
-      const rows = await server.db<
+      const { data, hit } = await getOrSet(
+        server,
+        `quarterly:${sym}`,
+        300,
+        async () => {
+          // Get the last N quarterly_financials for this symbol
+          const rows = await server.db<
         {
           period_end: Date;
           net_margin: number | null;
@@ -79,7 +85,12 @@ export async function registerQuarterlyRoutes(
         };
       });
 
-      return reply.send({ symbol: sym, points });
+          return { symbol: sym, points };
+        },
+      );
+
+      reply.header("x-cache", hit ? "HIT" : "MISS");
+      return reply.send(data);
     },
   );
 }

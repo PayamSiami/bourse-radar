@@ -1,21 +1,21 @@
 import type { FastifyInstance } from "fastify";
-import IORedis from "ioredis";
+import { Redis } from "ioredis";
 import { config } from "#config";
 import { logger } from "#utils/logger";
 
 declare module "fastify" {
   interface FastifyInstance {
-    redis: IORedis;
+    redis: Redis;
   }
 }
 
 export async function registerRedis(server: FastifyInstance) {
-  const redis = new IORedis(config.redis.url, {
+  const redis = new Redis(config.redis.url, {
     maxRetriesPerRequest: 3,
-    retryStrategy: (times) => Math.min(times * 50, 2000),
+    retryStrategy: (times: number) => Math.min(times * 50, 2000),
   });
 
-  redis.on("error", (err) => logger.error(err, "Redis error"));
+  redis.on("error", (err: Error) => logger.error(err, "Redis error"));
   redis.on("reconnecting", () => logger.warn("Redis reconnecting…"));
 
   try {

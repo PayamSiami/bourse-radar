@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { getOrSet } from "#utils/cache";
 
 interface MomRow {
   symbol: string;
@@ -33,8 +34,16 @@ export async function registerSalesTrendsRoutes(
       },
     },
     async (req, reply) => {
-      // 1) Two most recent months
-      const months = await server.db<{ month_end: Date }[]>`
+      // Trends only change when monthly_sales is ingested (daily at 14:00),
+      // so a 10-minute shared entry is both safe and measurably faster —
+      // the cumulative query alone fans out to ~4 CTEs.
+      const { data, hit } = await getOrSet(
+        server,
+        "sales-trends:list",
+        600,
+        async () => {
+          // 1) Two most recent months
+          const months = await server.db<{ month_end: Date }[]>`
         SELECT DISTINCT month_end
         FROM monthly_sales
         ORDER BY month_end DESC
@@ -42,12 +51,12 @@ export async function registerSalesTrendsRoutes(
       `;
 
       if (months.length < 2) {
-        return reply.send({
+        return {
           gainers: [],
           losers: [],
           cumulative: [],
           meta: { message: "Not enough monthly data" },
-        });
+        };
       }
 
       const latest = months[0]!.month_end;
@@ -173,17 +182,22 @@ export async function registerSalesTrendsRoutes(
         LIMIT 5
       `;
 
-      return reply.send({
-        gainers,
-        losers,
-        cumulative,
-        meta: {
-          latestMonth: latest.toISOString(),
-          previousMonth: previous.toISOString(),
-          generatedAt: new Date().toISOString(),
-          mode: "detail_first_then_12m",
+          return {
+            gainers,
+            losers,
+            cumulative,
+            meta: {
+              latestMonth: latest.toISOString(),
+              previousMonth: previous.toISOString(),
+              generatedAt: new Date().toISOString(),
+              mode: "detail_first_then_12m",
+            },
+          };
         },
-      });
+      );
+
+      reply.header("x-cache", hit ? "HIT" : "MISS");
+      return reply.send(data);
     },
   );
 }

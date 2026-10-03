@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { fetchRankings, RankingItem } from "@/lib/api";
@@ -14,7 +14,9 @@ function faNum(n: number | string | null | undefined): string {
     return Number(n).toLocaleString("fa-IR");
 }
 
-export default function StocksPage() {
+// useSearchParams() requires a <Suspense> boundary in Next 16's static
+// pre-render, or the build fails with "missing-suspense-with-csr-bailout".
+function StocksPageInner() {
     const searchParams = useSearchParams();
     const sectorFromUrl = searchParams.get("sector");
 
@@ -23,6 +25,7 @@ export default function StocksPage() {
     const [error, setError] = useState<string | null>(null);
     const [sort, setSort] = useState<SortKey>("rank");
     const [query, setQuery] = useState("");
+    const [debouncedQuery, setDebouncedQuery] = useState("");
 
     useEffect(() => {
         fetchRankings(200)
@@ -31,6 +34,11 @@ export default function StocksPage() {
             .finally(() => setLoading(false));
     }, []);
 
+    // SearchBar debounces its own onSearch to 200ms — mirror it directly.
+    useEffect(() => {
+        setDebouncedQuery(query);
+    }, [query]);
+
     const filtered = useMemo(() => {
         let list = items;
 
@@ -38,13 +46,13 @@ export default function StocksPage() {
             list = list.filter((s) => s.sector === sectorFromUrl);
         }
 
-        if (query) {
-            const q = query.trim();
-            list = list.filter((s) => s.symbol.includes(q) || s.name.includes(q));
+        const dq = debouncedQuery.trim();
+        if (dq) {
+            list = list.filter((s) => s.symbol.includes(dq) || s.name.includes(dq));
         }
 
         return list;
-    }, [items, query, sectorFromUrl]);
+    }, [items, debouncedQuery, sectorFromUrl]);
 
     const sorted = useMemo(() => {
         const copy = [...filtered];
@@ -116,14 +124,9 @@ export default function StocksPage() {
                     </div>
                 )}
 
-                {/* Grid */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                    {loading
-                        ? Array.from({ length: 8 }).map((_, i) => (
-                            <StockSkeleton key={i} />
-                        ))
-                        : sorted.map((s) => <StockCard key={s.symbol} stock={s} />)}
-                </div>
+                {/* Grid — show only the first N and reveal more on demand
+                    so mounting 200 heavy StockCards doesn't block first paint. */}
+                <WindowedGrid items={sorted} loading={loading} />
 
                 {/* Empty state */}
                 {!loading && !error && sorted.length === 0 && (
@@ -146,5 +149,103 @@ export default function StocksPage() {
                 )}
             </div>
         </main>
+    );
+}
+
+export default function StocksPage() {
+    return (
+        <Suspense
+            fallback={
+                <main className="flex-1 bg-app">
+                    <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8">
+                        <WindowedGrid items={[]} loading />
+                    </div>
+                </main>
+            }
+        >
+            <StocksPageInner />
+        </Suspense>
+    );
+}
+
+// ──────────────────────────────────────────────────────────
+// Progressive list — avoids mounting 200 StockCards at once.
+// IntersectionObserver is zero-dep and correctly handles
+// flex/grid reflow; falls back to "show all" if unavailable.
+// ──────────────────────────────────────────────────────────
+
+function WindowedGrid({
+    items,
+    loading,
+}: {
+    items: import("@/lib/api").RankingItem[];
+    loading: boolean;
+}) {
+    const STEP = 24;
+    const [visible, setVisible] = useState(STEP);
+    const sentinelRef = useRef<HTMLDivElement | null>(null);
+
+    // Filter/sort changed -> reset window so new results appear immediately.
+    useEffect(() => {
+        setVisible(STEP);
+    }, [items]);
+
+    useEffect(() => {
+        if (loading) return;
+        const el = sentinelRef.current;
+        if (!el) return;
+        if (visible >= items.length) return;
+
+        // SSR-safe: typeof IntersectionObserver avoids a ReferenceError
+        // in environments without it (tests, older WebViews).
+        if (typeof IntersectionObserver === "undefined") {
+            setVisible(items.length);
+            return;
+        }
+
+        const io = new IntersectionObserver(
+            (entries) => {
+                const first = entries[0];
+                if (first?.isIntersecting) {
+                    setVisible((n) => Math.min(n + STEP, items.length));
+                }
+            },
+            { rootMargin: "600px" },
+        );
+        io.observe(el);
+        return () => io.disconnect();
+    }, [items.length, loading, visible]);
+
+    if (loading) {
+        return (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                {Array.from({ length: 8 }).map((_, i) => (
+                    <StockSkeleton key={i} />
+                ))}
+            </div>
+        );
+    }
+
+    const slice = items.slice(0, visible);
+
+    return (
+        <>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                {slice.map((s) => (
+                    <StockCard key={s.symbol} stock={s} />
+                ))}
+            </div>
+            {visible < items.length && (
+                <div
+                    ref={sentinelRef}
+                    className="mt-6 flex justify-center"
+                    aria-hidden="true"
+                >
+                    <span className="text-xs text-muted tabular">
+                        {visible} / {items.length}
+                    </span>
+                </div>
+            )}
+        </>
     );
 }

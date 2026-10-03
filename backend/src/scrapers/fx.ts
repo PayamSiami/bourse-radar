@@ -1,7 +1,7 @@
 /**
  * FX Rate Scraper — USD/IRR (Rial) and USD/Toman rates
  *
- * Bonyadnegar.ir reports every market-cap and sales figure in BOTH Rial and
+ * reports every market-cap and sales figure in BOTH Rial and
  * USD, carrying an explicit provenance record on each value:
  *
  *   fxRateToman      Toman per 1 USD
@@ -35,7 +35,6 @@ const H = {
 };
 
 const WALLEX_MARKETS = "https://api.wallex.ir/v1/markets";
-const NOBITEX_ORDERBOOK = "https://api.nobitex.ir/v3/orderbook/USDTIRT";
 const NOBITEX_HOSTS = [
   "https://api.nobitex.ir",
   "https://api.nobitex.com",

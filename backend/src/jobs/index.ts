@@ -11,6 +11,7 @@ import {
   fetchCurrentPrices,
   upsertStocks,
   insertPrices,
+  pruneOldPrices,
   syncMonthlySales,
   syncQuarterlyFinancials,
   recomputeForwardPe,
@@ -118,6 +119,17 @@ export async function initializeJobs(server: FastifyInstance): Promise<void> {
       task: async () => {
         logger.info("[job] refreshing rankings materialized view");
         await refreshRankings(server.db);
+      },
+    },
+
+    // ── 8. Retention prune (daily at 5 AM — before the day's ingestion)
+    {
+      name: "prune-prices",
+      schedule: "0 5 * * *",
+      task: async () => {
+        logger.info("[job] pruning prices older than 30 days");
+        const n = await pruneOldPrices(server.db, 30);
+        logger.info(`[job] pruned ${n} price rows`);
       },
     },
 

@@ -1,4 +1,5 @@
 // components/footer.tsx
+import Image from "next/image";
 import Link from "next/link";
 
 const LINKS = [
@@ -18,11 +19,14 @@ export function Footer() {
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
                     {/* Brand */}
                     <div>
-                        <div className="flex items-center gap-3 mb-3">
-                            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center text-white shadow-lg shadow-brand-500/20">
-                                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                                    <path d="M3 17l6-6 4 4 8-8" />
-                                </svg>
+                        <div className="flex items-center mb-3 gap-3">
+                            <div className="relative w-10 h-10 flex items-center justify-center text-white">
+                                <Image
+                                    alt="logo"
+                                    fill
+                                    src={"/logo.webp"}
+                                    sizes="10px"
+                                />
                             </div>
                             <div>
                                 <div className="font-bold text-fg">
