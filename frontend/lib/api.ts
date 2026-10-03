@@ -1,10 +1,10 @@
 // Server-side (SSR) should use INTERNAL_API_URL when available so fetches
-// stay inside the compose network (http://api:8000/api) instead of going
+// stay inside the compose network (http://api:8001/api) instead of going
 // through the public origin. Client keeps NEXT_PUBLIC_API_URL.
 const API_URL =
   (typeof window === "undefined" && process.env.INTERNAL_API_URL) ||
   process.env.NEXT_PUBLIC_API_URL ||
-  "http://localhost:8000/api";
+  "http://localhost:8001/api";
 
 /* ---------- Types ---------- */
 

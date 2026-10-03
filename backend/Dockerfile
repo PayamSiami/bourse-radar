@@ -41,11 +41,11 @@ RUN addgroup -S appgroup && adduser -S -G appgroup appuser \
   && chown -R appuser:appgroup /app
 USER appuser
 
-EXPOSE 8000
+EXPOSE 8001
 
 # Healthcheck hits /api/health (the real route — /health returns 404)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "const h=require('http');h.get('http://127.0.0.1:8000/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+  CMD node -e "const h=require('http');h.get('http://127.0.0.1:8001/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
 ENTRYPOINT ["dumb-init", "--"]
 CMD ["node", "dist/src/index.js"]

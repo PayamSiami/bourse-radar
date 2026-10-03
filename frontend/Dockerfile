@@ -15,7 +15,7 @@ COPY . .
 # NEXT_PUBLIC_* is baked into the client bundle at build time, so the
 # internal API host must be known here. Docker-compose overrides the
 # server-side var at runtime for SSR fetches.
-ARG NEXT_PUBLIC_API_URL=http://localhost:8000/api
+ARG NEXT_PUBLIC_API_URL=http://localhost:8001/api
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV DOCKER_BUILD=1

@@ -22,7 +22,7 @@ export async function registerSwagger(server: FastifyInstance) {
           url: "https://bourse-radar.ir",
         },
       },
-      host: "localhost:8000",
+      host: "localhost:8001",
       schemes: ["http"],
     },
   });
@@ -49,5 +49,5 @@ export async function registerSwagger(server: FastifyInstance) {
     },
   });
 
-  logger.info("✓ Swagger UI at http://localhost:8000/docs");
+  logger.info("✓ Swagger UI at http://localhost:8001/docs");
 }

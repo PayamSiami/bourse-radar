@@ -227,10 +227,10 @@ hours later.
 
 ```ts
 DATABASE_URL: z.string().url(),   // required — no default
-PORT: z.coerce.number().int().default(8000),
+PORT: z.coerce.number().int().default(8001),
 ```
 
-`z.coerce` converts `"8000"` (always a string in env) into a number. The parsed
+`z.coerce` converts `"8001"` (always a string in env) into a number. The parsed
 result is re-exported as a nested, immutable object with friendlier names:
 
 ```ts
@@ -691,8 +691,8 @@ psql "$DATABASE_URL" -f migrations/0006_fx_and_mcap.sql
 ### Verify
 
 ```bash
-curl localhost:8000/api/health        # {"status":"ok",...}
-open  localhost:8000/docs             # Swagger UI (dev only)
+curl localhost:8001/api/health        # {"status":"ok",...}
+open  localhost:8001/docs             # Swagger UI (dev only)
 ```
 
 ---
@@ -707,7 +707,7 @@ open  localhost:8000/docs             # Swagger UI (dev only)
 | `Cannot use namespace 'IORedis' as a type` | wrong ioredis import | use `import { Redis } from "ioredis"` |
 | `spawn EPERM` | blocked child-process spawn | use `node --experimental-strip-types` |
 | `browserType.launch: spawn EPERM` | Playwright can't start Chrome | run ingest on the host, not the sandbox |
-| `EADDRINUSE 0.0.0.0:8000` | previous instance still running | `netstat -ano \| findstr 8000` → `Stop-Process -Id <pid> -Force` |
+| `EADDRINUSE 0.0.0.0:8001` | previous instance still running | `netstat -ano \| findstr 8001` → `Stop-Process -Id <pid> -Force` |
 | Everything `non_calculable` | Phase 3 (Playwright) never ran | run `GET /api/admin/ingest` on a machine that can spawn Chrome |
 | Constant `429` from Codal | cooldown in effect | **wait 2–3 min**, do not retry |
 

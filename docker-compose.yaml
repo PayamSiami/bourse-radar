@@ -53,15 +53,15 @@ services:
       - .env
     environment:
       NODE_ENV: production
-      PORT: 8000
+      PORT: 8001
       # Override file-based URLs so the container reaches sibling services by name
       DATABASE_URL: postgres://${POSTGRES_USER:-bourse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bourse_radar}
       REDIS_URL: redis://redis:6379
     ports:
       # Bind to loopback only; nginx/Caddy terminates TLS and proxies to these.
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8001"
     healthcheck:
-      test: ["CMD", "node", "-e", "const h=require('http');h.get('http://127.0.0.1:8000/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "const h=require('http');h.get('http://127.0.0.1:8001/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -91,7 +91,7 @@ services:
       # Server-side fetches from Next SSR should hit api directly inside the
       # compose network (faster, no hop through nginx). Client still uses
       # NEXT_PUBLIC_API_URL above. Must include the /api prefix — see lib/api.ts.
-      INTERNAL_API_URL: http://api:8000/api
+      INTERNAL_API_URL: http://api:8001/api
     healthcheck:
       test: ["CMD", "node", "-e", "const h=require('http');h.get('http://127.0.0.1:3000/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
       interval: 30s
